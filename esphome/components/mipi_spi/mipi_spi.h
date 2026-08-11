@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cstring>
 #include <utility>
 
 #include "esphome/components/spi/spi.h"
@@ -12,10 +11,8 @@ namespace esphome::mipi_spi {
 
 constexpr static const char *const TAG = "display.mipi_spi";
 
-// Maximum bytes to log for commands (truncated if larger)
 static constexpr size_t MIPI_SPI_MAX_CMD_LOG_BYTES = 64;
 
-// Command codes for MIPI SPI displays. Not all currently used, kept here for reference.
 static constexpr uint8_t SW_RESET_CMD = 0x01;
 static constexpr uint8_t SLEEP_OUT = 0x11;
 static constexpr uint8_t NORON = 0x13;
@@ -36,23 +33,21 @@ static constexpr uint8_t SWIRE1 = 0x5A;
 static constexpr uint8_t SWIRE2 = 0x5B;
 static constexpr uint8_t PAGESEL = 0xFE;
 
-static constexpr uint8_t MADCTL_MY = 0x80;           // Bit 7 Bottom to top
-static constexpr uint8_t MADCTL_MX = 0x40;           // Bit 6 Right to left
-static constexpr uint8_t MADCTL_MV = 0x20;           // Bit 5 Swap axes
-static constexpr uint8_t MADCTL_RGB = 0x00;          // Bit 3 Red-Green-Blue pixel order
-static constexpr uint8_t MADCTL_BGR = 0x08;          // Bit 3 Blue-Green-Red pixel order
-static constexpr uint8_t MADCTL_XFLIP = 0x02;        // Mirror the display horizontally
-static constexpr uint8_t MADCTL_YFLIP = 0x01;        // Mirror the display vertically
-static constexpr uint16_t MADCTL_FLIP_FLAG = 0x100;  // controller uses axis flip bits
+static constexpr uint8_t MADCTL_MY = 0x80;
+static constexpr uint8_t MADCTL_MX = 0x40;
+static constexpr uint8_t MADCTL_MV = 0x20;
+static constexpr uint8_t MADCTL_RGB = 0x00;
+static constexpr uint8_t MADCTL_BGR = 0x08;
+static constexpr uint8_t MADCTL_XFLIP = 0x02;
+static constexpr uint8_t MADCTL_YFLIP = 0x01;
+static constexpr uint16_t MADCTL_FLIP_FLAG = 0x100;
 
 static constexpr uint8_t DELAY_FLAG = 0xFF;
-// store a 16 bit value in a buffer, big endian.
 static inline void put16_be(uint8_t *buf, uint16_t value) {
   buf[0] = value >> 8;
   buf[1] = value;
 }
 
-// Buffer mode, conveniently also the number of bytes in a pixel
 enum PixelMode {
   PIXEL_MODE_8 = 1,
   PIXEL_MODE_16 = 2,
@@ -63,10 +58,9 @@ enum BusType {
   BUS_TYPE_SINGLE = 1,
   BUS_TYPE_QUAD = 4,
   BUS_TYPE_OCTAL = 8,
-  BUS_TYPE_SINGLE_16 = 16,  // Single bit bus, but 16 bits per transfer
+  BUS_TYPE_SINGLE_16 = 16,
 };
 
-// Helper function for dump_config - defined in mipi_spi.cpp to allow use of LOG_PIN macro
 void internal_dump_config(const char *model, int width, int height, int offset_width, int offset_height, uint8_t madctl,
                           bool invert_colors, int display_bits, bool is_big_endian, const optional<uint8_t> &brightness,
                           GPIOPin *cs, GPIOPin *reset, GPIOPin *dc, int spi_mode, uint32_t data_rate, int bus_width,
@@ -202,6 +196,7 @@ class MipiSpi : public display::Display,
       return get_height();
     return HEIGHT;
   }
+
   void write_command_(uint8_t cmd, uint8_t data) { this->write_command_(cmd, &data, 1); }
   void write_command_(uint8_t cmd) { this->write_command_(cmd, &cmd, 0); }
 
@@ -464,8 +459,43 @@ class MipiSpiBuffer
     }
   }
 
-  // Render into the framebuffer without sending it to the display. Intended for full-buffer displays so rendering can
-  // overlap a previously queued SPI DMA flush.
+  // Direct framebuffer access for performance-sensitive renderers. These helpers are intentionally restricted to a
+  // full framebuffer so callers can use logical screen coordinates without having to account for start_line_.
+  BUFFERTYPE *get_framebuffer() {
+    if constexpr (FRACTION != 1)
+      return nullptr;
+    return this->buffer_;
+  }
+
+  size_t get_framebuffer_stride() {
+    if constexpr (FRACTION != 1)
+      return 0;
+    return round_buffer(this->get_width_internal());
+  }
+
+  BUFFERTYPE native_color(const Color &color) { return convert_color(color); }
+
+  void mark_dirty(int x0, int y0, int x1, int y1) {
+    if constexpr (FRACTION != 1)
+      return;
+    if (x0 > x1)
+      std::swap(x0, x1);
+    if (y0 > y1)
+      std::swap(y0, y1);
+    x0 = clamp(x0, 0, this->get_width_internal() - 1);
+    x1 = clamp(x1, 0, this->get_width_internal() - 1);
+    y0 = clamp(y0, 0, this->get_height_internal() - 1);
+    y1 = clamp(y1, 0, this->get_height_internal() - 1);
+    if (x0 < this->x_low_)
+      this->x_low_ = x0;
+    if (x1 > this->x_high_)
+      this->x_high_ = x1;
+    if (y0 < this->y_low_)
+      this->y_low_ = y0;
+    if (y1 > this->y_high_)
+      this->y_high_ = y1;
+  }
+
   bool render_only() {
     if (this->is_failed())
       return false;
@@ -487,7 +517,6 @@ class MipiSpiBuffer
     return true;
   }
 
-  // Finish a queued asynchronous pixel transfer if it has completed. Returns true while DMA is still active.
   bool service_async_flush() {
     if (!this->async_transaction_open_)
       return false;
@@ -500,8 +529,6 @@ class MipiSpiBuffer
 
   bool async_flush_busy() { return this->service_async_flush(); }
 
-  // Queue the current dirty rectangle for asynchronous transfer. On the ESP-IDF backend write_array_async() takes an
-  // internal DMA-capable copy before returning, so the framebuffer may be modified immediately afterward.
   bool start_async_flush() {
     if (this->is_failed())
       return false;
@@ -632,14 +659,18 @@ class MipiSpiBuffer
     if (x < 0 || x >= this->get_width_internal() || y < this->start_line_ || y >= this->end_line_)
       return;
     this->buffer_[(y - this->start_line_) * round_buffer(this->get_width_internal()) + x] = convert_color(color);
-    if (x < this->x_low_)
+    if (x < this->x_low_) {
       this->x_low_ = x;
-    if (x > this->x_high_)
+    }
+    if (x > this->x_high_) {
       this->x_high_ = x;
-    if (y < this->y_low_)
+    }
+    if (y < this->y_low_) {
       this->y_low_ = y;
-    if (y > this->y_high_)
+    }
+    if (y > this->y_high_) {
       this->y_high_ = y;
+    }
   }
 
   void fill(Color color) override {
