@@ -52,18 +52,18 @@ static inline int32_t sin_q15(uint8_t phase) {
   }
 }
 
-template<typename DisplayT> SuzanneStats render_suzanne(DisplayT &display, uint8_t phase_x, uint8_t phase_y) {
-  using PixelT = std::remove_pointer_t<decltype(display.get_framebuffer())>;
+template<typename DisplayT> SuzanneStats render_suzanne(DisplayT *display, uint8_t phase_x, uint8_t phase_y) {
+  using PixelT = std::remove_pointer_t<decltype(display->get_framebuffer())>;
   static_assert(sizeof(PixelT) == 2, "Suzanne demo expects a 16-bit framebuffer");
 
   SuzanneStats stats{};
-  auto *fb = display.get_framebuffer();
+  auto *fb = display->get_framebuffer();
   if (fb == nullptr)
     return stats;
 
-  const int screen_w = display.get_width();
-  const int screen_h = display.get_height();
-  const int stride = static_cast<int>(display.get_framebuffer_stride());
+  const int screen_w = display->get_width();
+  const int screen_h = display->get_height();
+  const int stride = static_cast<int>(display->get_framebuffer_stride());
   if (screen_w <= 0 || screen_h <= 0 || stride <= 0)
     return stats;
 
@@ -77,12 +77,12 @@ template<typename DisplayT> SuzanneStats render_suzanne(DisplayT &display, uint8
   constexpr size_t TOTAL_VERTS = HALF_VERTS * 2;
   static std::array<SuzanneRenderVertex, TOTAL_VERTS> projected{};
 
-  const PixelT black = display.native_color(Color(0, 0, 0));
+  const PixelT black = display->native_color(Color(0, 0, 0));
 
   std::array<PixelT, 32> shade_palette{};
   for (int i = 0; i < 32; i++) {
     const int level = (i * 255 + 15) / 31;
-    shade_palette[i] = display.native_color(
+    shade_palette[i] = display->native_color(
         Color(static_cast<uint8_t>((70 * level) / 255), static_cast<uint8_t>((185 * level) / 255),
               static_cast<uint8_t>((255 * level) / 255)));
   }
@@ -125,7 +125,7 @@ template<typename DisplayT> SuzanneStats render_suzanne(DisplayT &display, uint8
     p.x = static_cast<int16_t>(center_x + static_cast<int32_t>((static_cast<int64_t>(x1) * FOCAL) / depth));
     p.y = static_cast<int16_t>(center_y - static_cast<int32_t>((static_cast<int64_t>(y2) * FOCAL) / depth));
     int32_t inv_z = 65535 / depth;
-    inv_z = std::clamp(inv_z, 1, 255);
+    inv_z = std::clamp<int32_t>(inv_z, 1, 255);
     p.inv_z = static_cast<uint8_t>(inv_z);
   };
 
@@ -325,10 +325,10 @@ template<typename DisplayT> SuzanneStats render_suzanne(DisplayT &display, uint8
   }
 
   if (!have_old_box) {
-    display.mark_dirty(0, 0, screen_w - 1, screen_h - 1);
+    display->mark_dirty(0, 0, screen_w - 1, screen_h - 1);
   } else {
-    display.mark_dirty(std::min(old_x0, new_x0), std::min(old_y0, new_y0), std::max(old_x1, new_x1),
-                       std::max(old_y1, new_y1));
+    display->mark_dirty(std::min(old_x0, new_x0), std::min(old_y0, new_y0), std::max(old_x1, new_x1),
+                        std::max(old_y1, new_y1));
   }
 
   old_x0 = new_x0;
