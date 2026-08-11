@@ -244,6 +244,19 @@ class SPIDelegate {
       this->transfer(ptr[i]);
   }
 
+  // Queue a write and return immediately when supported by the hardware backend.
+  // The default implementation is synchronous, so existing backends remain compatible.
+  virtual bool write_array_async(const uint8_t *ptr, size_t length) {
+    this->write_array(ptr, length);
+    return true;
+  }
+
+  // Poll whether a previously queued asynchronous write is still active.
+  virtual bool async_busy() { return false; }
+
+  // Wait for a previously queued asynchronous write to finish.
+  virtual bool wait_async() { return true; }
+
   // read into a buffer, write nulls
   virtual void read_array(uint8_t *ptr, size_t length) {
     for (size_t i = 0; i != length; i++)
@@ -503,6 +516,12 @@ class SPIDevice : public SPIClient {
   void disable() { this->delegate_->end_transaction(); }
 
   void write_array(const uint8_t *data, size_t length) { this->delegate_->write_array(data, length); }
+
+  bool write_array_async(const uint8_t *data, size_t length) { return this->delegate_->write_array_async(data, length); }
+
+  bool async_busy() { return this->delegate_->async_busy(); }
+
+  bool wait_async() { return this->delegate_->wait_async(); }
 
   template<size_t N> void write_array(const std::array<uint8_t, N> &data) { this->write_array(data.data(), N); }
 
