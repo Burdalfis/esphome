@@ -186,10 +186,7 @@ void BluetoothProxy::dump_config() {
 
 #ifdef USE_BLUETOOTH_PROXY_CONNECTIONS
 
-// maybe_unused: in a passive proxy (active: false) MAX is 0, the body is removed, and connection is unused.
-void BluetoothProxy::register_connection([[maybe_unused]] BluetoothConnection *connection) {
-// Guard the always-false comparison (-Wtype-limits) in a passive proxy (active: false), where MAX is 0.
-#if BLUETOOTH_PROXY_MAX_CONNECTIONS > 0
+void BluetoothProxy::register_connection(BluetoothConnection *connection) {
   if (this->connection_count_ >= BLUETOOTH_PROXY_MAX_CONNECTIONS) {
     // Cannot happen with codegen-sized registration; a silent drop would
     // surface later as a null proxy_ dereference, so refuse loudly.
@@ -200,7 +197,6 @@ void BluetoothProxy::register_connection([[maybe_unused]] BluetoothConnection *c
   connection->connection_index_ = this->connection_count_;
   this->connections_[this->connection_count_++] = connection;
   connection->proxy_ = this;
-#endif
 }
 
 void BluetoothProxy::log_slot_accounting_mismatch_() { ESP_LOGW(TAG, "Connection slot free-count mismatch, clamped"); }
@@ -644,10 +640,12 @@ void BluetoothProxy::loop() {
   for (uint8_t i = 0; i < this->connection_count_; i++) {
     this->connections_[i]->flush_owed_replies_();
   }
-  // Address-keyed, not slot-keyed, so it gets its own loop. Not pre-cleared:
+  // Address-keyed, not slot-keyed, so it gets its own loop; bounded by
+  // connection_count_ like the latch and clear helpers. Not pre-cleared:
   // the sender clears on success and re-latches on refusal, keeping the
   // latch's leading-edge warn honest (same shape as the unpair drain).
-  for (auto &owed : this->pending_disconnections_) {
+  for (uint8_t i = 0; i < this->connection_count_; i++) {
+    auto &owed = this->pending_disconnections_[i];
     if (owed.empty())
       continue;
     this->send_device_disconnected_(owed.address(), owed.error());
