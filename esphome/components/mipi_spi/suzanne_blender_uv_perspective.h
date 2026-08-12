@@ -231,6 +231,7 @@ PerspectiveStats render_suzanne_blender_uv_perspective(DisplayT *display, uint8_
     }
   };
 
+  static bool frame_initialized = false;
   static bool have_old_box = false;
   static int old_x0 = 0;
   static int old_y0 = 0;
@@ -238,9 +239,9 @@ PerspectiveStats render_suzanne_blender_uv_perspective(DisplayT *display, uint8_
   static int old_y1 = 0;
   static uint32_t dma_high_water_bytes = 0;
 
-  if (!have_old_box)
+  if (!frame_initialized)
     std::fill_n(fb, static_cast<size_t>(stride) * screen_h, black);
-  else
+  else if (have_old_box)
     fill_rect(old_x0, old_y0, old_x1, old_y1, black);
 
   auto draw_span = [&](int y, int32_t xa, int32_t wa, int32_t sa, int32_t uowa, int32_t vowa,
@@ -459,15 +460,49 @@ PerspectiveStats render_suzanne_blender_uv_perspective(DisplayT *display, uint8_
     const int32_t nx = e1y * e2z - e1z * e2y;
     const int32_t ny = e1z * e2x - e1x * e2z;
     const int32_t nz = e1x * e2y - e1y * e2x;
+    const int32_t da = camera_z + pa.cz;
+    const int32_t db = camera_z + pb.cz;
+    const int32_t dc = camera_z + pc.cz;
     const int64_t view_dot = static_cast<int64_t>(nx) * pa.cx + static_cast<int64_t>(ny) * pa.cy +
-                             static_cast<int64_t>(nz) * (camera_z + pa.cz);
+                             static_cast<int64_t>(nz) * da;
     if (view_dot >= 0)
       return;
 
+    const bool ia_front = da >= SUZANNE_PERSPECTIVE_NEAR_DEPTH;
+    const bool ib_front = db >= SUZANNE_PERSPECTIVE_NEAR_DEPTH;
+    const bool ic_front = dc >= SUZANNE_PERSPECTIVE_NEAR_DEPTH;
+    if (!ia_front && !ib_front && !ic_front)
+      return;
+
+    stats.visible_triangles++;
+
+    // Hot path: the ordinary demo lives entirely in front of the near plane.
+    // Preserve the shared per-vertex projection work and only attach this
+    // face's UVs here, exactly as before clipping support was added.
+    if (ia_front && ib_front && ic_front) {
+      PerspectiveRenderVertex a = pa;
+      PerspectiveRenderVertex b = pb;
+      PerspectiveRenderVertex c = pc;
+      a.u_over_w = static_cast<int32_t>(static_cast<int64_t>(uva.u) * a.inv_w);
+      a.v_over_w = static_cast<int32_t>(static_cast<int64_t>(uva.v) * a.inv_w);
+      b.u_over_w = static_cast<int32_t>(static_cast<int64_t>(uvb.u) * b.inv_w);
+      b.v_over_w = static_cast<int32_t>(static_cast<int64_t>(uvb.v) * b.inv_w);
+      c.u_over_w = static_cast<int32_t>(static_cast<int64_t>(uvc.u) * c.inv_w);
+      c.v_over_w = static_cast<int32_t>(static_cast<int64_t>(uvc.v) * c.inv_w);
+      extend_new_box(a);
+      extend_new_box(b);
+      extend_new_box(c);
+      fill_triangle(a, b, c);
+      stats.rasterized_triangles++;
+      return;
+    }
+
+    // Slow path: only a triangle that actually crosses the plane gets clipped
+    // and has its generated intersections projected.
     const std::array<SuzanneNearClipVertex, 3> clip_input = {{
-        {pa.cx, pa.cy, camera_z + pa.cz, pa.shade, uva.u, uva.v},
-        {pb.cx, pb.cy, camera_z + pb.cz, pb.shade, uvb.u, uvb.v},
-        {pc.cx, pc.cy, camera_z + pc.cz, pc.shade, uvc.u, uvc.v},
+        {pa.cx, pa.cy, da, pa.shade, uva.u, uva.v},
+        {pb.cx, pb.cy, db, pb.shade, uvb.u, uvb.v},
+        {pc.cx, pc.cy, dc, pc.shade, uvc.u, uvc.v},
     }};
     std::array<SuzanneNearClipVertex, 4> clipped{};
     const size_t clipped_count = clip_suzanne_triangle_near(clip_input, clipped);
@@ -495,7 +530,6 @@ PerspectiveStats render_suzanne_blender_uv_perspective(DisplayT *display, uint8_
     for (size_t i = 0; i < clipped_count; i++)
       raster[i] = project_clipped(clipped[i]);
 
-    stats.visible_triangles++;
     for (size_t i = 1; i + 1 < clipped_count; i++) {
       extend_new_box(raster[0]);
       extend_new_box(raster[i]);
@@ -543,12 +577,11 @@ PerspectiveStats render_suzanne_blender_uv_perspective(DisplayT *display, uint8_
   int dirty_y0 = 0;
   int dirty_x1 = -1;
   int dirty_y1 = -1;
-  if (!have_old_box) {
-    // First frame always clears/transfers the whole display, including the case
-    // where the entire object is behind the near plane.
+  if (!frame_initialized) {
+    // First frame always transfers the whole framebuffer once.
     dirty_x1 = screen_w - 1;
     dirty_y1 = screen_h - 1;
-  } else {
+  } else if (have_old_box) {
     int raw_x0 = old_x0;
     int raw_y0 = old_y0;
     int raw_x1 = old_x1;
@@ -563,12 +596,19 @@ PerspectiveStats render_suzanne_blender_uv_perspective(DisplayT *display, uint8_
     dirty_y0 = std::max(0, raw_y0);
     dirty_x1 = std::min(screen_w - 1, raw_x1);
     dirty_y1 = std::min(screen_h - 1, raw_y1);
+  } else if (have_new_box) {
+    // Nothing was drawn last frame, so the framebuffer is already black; only
+    // the newly occupied region needs to be transferred.
+    dirty_x0 = std::max(0, new_x0);
+    dirty_y0 = std::max(0, new_y0);
+    dirty_x1 = std::min(screen_w - 1, new_x1);
+    dirty_y1 = std::min(screen_h - 1, new_y1);
   }
 
   if (dirty_x0 <= dirty_x1 && dirty_y0 <= dirty_y1) {
     stats.dirty_bytes = static_cast<uint32_t>(dirty_x1 - dirty_x0 + 1) *
                         static_cast<uint32_t>(dirty_y1 - dirty_y0 + 1) * sizeof(PixelT);
-    if (have_old_box)
+    if (frame_initialized)
       dma_high_water_bytes = std::max(dma_high_water_bytes, stats.dirty_bytes);
     display->mark_dirty(dirty_x0, dirty_y0, dirty_x1, dirty_y1);
   }
@@ -580,6 +620,7 @@ PerspectiveStats render_suzanne_blender_uv_perspective(DisplayT *display, uint8_
     old_x1 = new_x1;
     old_y1 = new_y1;
   }
+  frame_initialized = true;
   have_old_box = have_new_box;
 
   // Deliberately publish through the existing perspective stats accessor so the
