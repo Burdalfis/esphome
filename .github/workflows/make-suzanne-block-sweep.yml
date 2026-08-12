@@ -1,0 +1,73 @@
+name: Build Suzanne perspective sweep
+
+on:
+  push:
+    branches:
+      - agent/c6-async-mipi-dma
+    paths:
+      - .github/workflows/make-suzanne-block-sweep.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/c6-async-mipi-dma
+
+      - name: Generate sweep renderer
+        run: python3 .github/scripts/make_suzanne_block_sweep.py
+
+      - name: Strict C++17 compile test
+        shell: bash
+        run: |
+          cat >/tmp/suzanne_sweep_compile_test.cpp <<'CPP'
+          #include <cstddef>
+          #include <cstdint>
+
+          namespace esphome {
+          struct Color {
+            constexpr Color(int, int, int) {}
+          };
+          }
+
+          #include "esphome/components/mipi_spi/suzanne_blender_uv_perspective_64_sweep.h"
+
+          struct DummyDisplay {
+            uint16_t framebuffer[172 * 320]{};
+            uint16_t *get_framebuffer() { return framebuffer; }
+            int get_width() const { return 172; }
+            int get_height() const { return 320; }
+            std::size_t get_framebuffer_stride() const { return 172; }
+            uint16_t native_color(const esphome::Color &) const { return 0; }
+            void mark_dirty(int, int, int, int) {}
+          };
+
+          int main() {
+            DummyDisplay display;
+            for (int i = 0; i < 1025; i++) {
+              const auto stats = esphome::mipi_spi::demo3d::render_suzanne_blender_uv_perspective_64_sweep(
+                  &display, static_cast<uint8_t>(i), static_cast<uint8_t>(i + 10));
+              (void) stats;
+            }
+            return esphome::mipi_spi::demo3d::get_suzanne_perspective_sweep_block_pixels() == 2 &&
+                           esphome::mipi_spi::demo3d::get_suzanne_perspective_sweep_pass() == 1
+                       ? 0
+                       : 1;
+          }
+          CPP
+          g++ -std=c++17 -Wall -Wextra -Werror -I. /tmp/suzanne_sweep_compile_test.cpp -o /tmp/suzanne_sweep_compile_test
+          /tmp/suzanne_sweep_compile_test
+
+      - name: Commit generated renderer
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add esphome/components/mipi_spi/suzanne_blender_uv_perspective_64_sweep.h
+          git diff --cached --quiet && exit 0
+          git commit -m "Add automatic perspective block sweep [skip ci]"
+          git push origin HEAD:agent/c6-async-mipi-dma
