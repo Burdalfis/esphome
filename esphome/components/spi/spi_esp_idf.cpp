@@ -199,49 +199,55 @@ class SPIDelegateHw : public SPIDelegate {
       return true;
     }
 
-    if (length > this->async_buffer_size_) {
-      auto *new_buffer = static_cast<uint8_t *>(heap_caps_malloc(length, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
-      if (new_buffer == nullptr) {
-        ESP_LOGW(TAG, "Failed to allocate %zu byte DMA buffer, using synchronous transfer", length);
-        this->write_array(ptr, length);
-        return true;
-      }
-      if (this->async_buffer_ != nullptr)
-        heap_caps_free(this->async_buffer_);
-      this->async_buffer_ = new_buffer;
-      this->async_buffer_size_ = length;
+    if (!this->ensure_async_buffer_(length)) {
+      ESP_LOGW(TAG, "Failed to allocate %zu byte DMA buffer, using synchronous transfer", length);
+      this->write_array(ptr, length);
+      return true;
     }
 
     std::memcpy(this->async_buffer_, ptr, length);
-    this->async_count_ = 0;
-    this->async_completed_ = 0;
+    return this->queue_async_buffer_(length);
+  }
 
-    const uint8_t *data = this->async_buffer_;
-    size_t remaining = length;
-    while (remaining != 0) {
-      const size_t partial = std::min(remaining, MAX_TRANSFER_SIZE);
-      auto &desc = this->async_descs_[this->async_count_];
-      desc = {};
-      desc.length = partial * 8;
-      desc.rxlength = 0;
-      desc.tx_buffer = data;
-
-      const esp_err_t err = spi_device_queue_trans(this->handle_, &desc, portMAX_DELAY);
-      if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to queue async SPI transaction - err %X", err);
-        // Reap anything that was successfully queued before reporting failure.
-        this->async_active_ = this->async_count_ != 0;
-        this->wait_async();
-        return false;
-      }
-
-      this->async_count_++;
-      data += partial;
-      remaining -= partial;
+  bool write_array_async_strided(const uint8_t *ptr, size_t row_bytes, size_t rows, size_t stride) override {
+    if (row_bytes == 0 || rows == 0)
+      return true;
+    if (stride < row_bytes) {
+      ESP_LOGE(TAG, "Invalid strided SPI write: stride %zu is smaller than row size %zu", stride, row_bytes);
+      return false;
+    }
+    if (stride == row_bytes || rows == 1)
+      return this->write_array_async(ptr, row_bytes * rows);
+    if (!this->is_ready())
+      return false;
+    if (this->async_active_) {
+      ESP_LOGW(TAG, "Async SPI write requested while previous write is still active");
+      return false;
     }
 
-    this->async_active_ = true;
-    return true;
+    const size_t length = row_bytes * rows;
+    const size_t transaction_count = (length + MAX_TRANSFER_SIZE - 1) / MAX_TRANSFER_SIZE;
+    if (transaction_count > ASYNC_QUEUE_SIZE) {
+      ESP_LOGW(TAG, "Async strided SPI write too large for queue (%zu transactions), using synchronous transfer",
+               transaction_count);
+      for (size_t row = 0; row < rows; row++)
+        this->write_array(ptr + row * stride, row_bytes);
+      return true;
+    }
+
+    if (!this->ensure_async_buffer_(length)) {
+      ESP_LOGW(TAG, "Failed to allocate %zu byte DMA buffer for strided write, using synchronous transfer", length);
+      for (size_t row = 0; row < rows; row++)
+        this->write_array(ptr + row * stride, row_bytes);
+      return true;
+    }
+
+    uint8_t *dest = this->async_buffer_;
+    for (size_t row = 0; row < rows; row++) {
+      std::memcpy(dest, ptr + row * stride, row_bytes);
+      dest += row_bytes;
+    }
+    return this->queue_async_buffer_(length);
   }
 
   bool async_busy() override {
@@ -303,6 +309,64 @@ class SPIDelegateHw : public SPIDelegate {
   void read_array(uint8_t *ptr, size_t length) override { this->transfer(nullptr, ptr, length); }
 
  protected:
+  bool ensure_async_buffer_(size_t length) {
+    if (length <= this->async_buffer_size_)
+      return true;
+
+    constexpr uint32_t caps = MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL;
+    uint8_t *new_buffer = nullptr;
+    if (this->async_buffer_ == nullptr) {
+      new_buffer = static_cast<uint8_t *>(heap_caps_malloc(length, caps));
+    } else {
+      new_buffer = static_cast<uint8_t *>(heap_caps_realloc(this->async_buffer_, length, caps));
+      if (new_buffer == nullptr) {
+        // On a very tight heap, realloc may be unable to reserve the larger block while the old DMA buffer still
+        // exists. Release the old staging buffer and make one clean attempt at the requested size.
+        heap_caps_free(this->async_buffer_);
+        this->async_buffer_ = nullptr;
+        this->async_buffer_size_ = 0;
+        new_buffer = static_cast<uint8_t *>(heap_caps_malloc(length, caps));
+      }
+    }
+
+    if (new_buffer == nullptr)
+      return false;
+    this->async_buffer_ = new_buffer;
+    this->async_buffer_size_ = length;
+    return true;
+  }
+
+  bool queue_async_buffer_(size_t length) {
+    this->async_count_ = 0;
+    this->async_completed_ = 0;
+
+    const uint8_t *data = this->async_buffer_;
+    size_t remaining = length;
+    while (remaining != 0) {
+      const size_t partial = std::min(remaining, MAX_TRANSFER_SIZE);
+      auto &desc = this->async_descs_[this->async_count_];
+      desc = {};
+      desc.length = partial * 8;
+      desc.rxlength = 0;
+      desc.tx_buffer = data;
+
+      const esp_err_t err = spi_device_queue_trans(this->handle_, &desc, portMAX_DELAY);
+      if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to queue async SPI transaction - err %X", err);
+        this->async_active_ = this->async_count_ != 0;
+        this->wait_async();
+        return false;
+      }
+
+      this->async_count_++;
+      data += partial;
+      remaining -= partial;
+    }
+
+    this->async_active_ = true;
+    return true;
+  }
+
   bool add_device_() {
     spi_device_interface_config_t config = {};
     config.mode = static_cast<uint8_t>(this->mode_);
