@@ -8,8 +8,14 @@ namespace esphome::spi {
 
 #ifdef USE_ESP32
 static const char *const TAG = "spi-esp-idf";
-static const size_t MAX_TRANSFER_SIZE = 4092;  // dictated by ESP-IDF API.
-static const size_t ASYNC_QUEUE_SIZE = 32;
+static constexpr size_t MAX_TRANSFER_SIZE = 4092;  // dictated by ESP-IDF API.
+static constexpr size_t ASYNC_QUEUE_SIZE = 32;
+// Snapshot async writes into individually allocated DMA blocks instead of requiring one large contiguous slab.
+// The pool grows on demand and is retained, so fragmentation only needs to leave room for one 4092-byte block at a time.
+static constexpr size_t ASYNC_STAGING_BLOCK_SIZE = MAX_TRANSFER_SIZE;
+static constexpr size_t ASYNC_STAGING_BLOCKS = 16;
+static constexpr size_t ASYNC_STAGING_CAPACITY = ASYNC_STAGING_BLOCK_SIZE * ASYNC_STAGING_BLOCKS;
+static_assert(ASYNC_STAGING_BLOCKS <= ASYNC_QUEUE_SIZE, "Async staging pool must fit the SPI transaction queue");
 
 class SPIDelegateHw : public SPIDelegate {
  public:
@@ -61,8 +67,10 @@ class SPIDelegateHw : public SPIDelegate {
       if (err != ESP_OK)
         ESP_LOGE(TAG, "Remove device failed - err %X", err);
     }
-    if (this->async_buffer_ != nullptr)
-      heap_caps_free(this->async_buffer_);
+    for (size_t i = 0; i < this->async_block_count_; i++) {
+      if (this->async_blocks_[i] != nullptr)
+        heap_caps_free(this->async_blocks_[i]);
+    }
   }
 
   // do a transfer. either txbuf or rxbuf (but not both) may be null.
@@ -191,6 +199,13 @@ class SPIDelegateHw : public SPIDelegate {
     if (length == 0)
       return true;
 
+    if (length > ASYNC_STAGING_CAPACITY) {
+      ESP_LOGD(TAG, "Async SPI write %zu bytes exceeds %zu-byte staging pool, using synchronous transfer", length,
+               ASYNC_STAGING_CAPACITY);
+      this->write_array(ptr, length);
+      return true;
+    }
+
     const size_t transaction_count = (length + MAX_TRANSFER_SIZE - 1) / MAX_TRANSFER_SIZE;
     if (transaction_count > ASYNC_QUEUE_SIZE) {
       ESP_LOGW(TAG, "Async SPI write too large for queue (%zu transactions), using synchronous transfer",
@@ -199,14 +214,14 @@ class SPIDelegateHw : public SPIDelegate {
       return true;
     }
 
-    if (!this->ensure_async_buffer_(length)) {
-      ESP_LOGW(TAG, "Failed to allocate %zu byte DMA buffer, using synchronous transfer", length);
+    if (!this->ensure_async_blocks_(length)) {
+      ESP_LOGW(TAG, "Failed to grow DMA staging pool for %zu byte async write, using synchronous transfer", length);
       this->write_array(ptr, length);
       return true;
     }
 
-    std::memcpy(this->async_buffer_, ptr, length);
-    return this->queue_async_buffer_(length);
+    this->copy_async_linear_(ptr, length);
+    return this->queue_async_blocks_(length);
   }
 
   bool write_array_async_strided(const uint8_t *ptr, size_t row_bytes, size_t rows, size_t stride) override {
@@ -226,6 +241,14 @@ class SPIDelegateHw : public SPIDelegate {
     }
 
     const size_t length = row_bytes * rows;
+    if (length > ASYNC_STAGING_CAPACITY) {
+      ESP_LOGD(TAG, "Async strided SPI write %zu bytes exceeds %zu-byte staging pool, using synchronous transfer",
+               length, ASYNC_STAGING_CAPACITY);
+      for (size_t row = 0; row < rows; row++)
+        this->write_array(ptr + row * stride, row_bytes);
+      return true;
+    }
+
     const size_t transaction_count = (length + MAX_TRANSFER_SIZE - 1) / MAX_TRANSFER_SIZE;
     if (transaction_count > ASYNC_QUEUE_SIZE) {
       ESP_LOGW(TAG, "Async strided SPI write too large for queue (%zu transactions), using synchronous transfer",
@@ -235,19 +258,15 @@ class SPIDelegateHw : public SPIDelegate {
       return true;
     }
 
-    if (!this->ensure_async_buffer_(length)) {
-      ESP_LOGW(TAG, "Failed to allocate %zu byte DMA buffer for strided write, using synchronous transfer", length);
+    if (!this->ensure_async_blocks_(length)) {
+      ESP_LOGW(TAG, "Failed to grow DMA staging pool for %zu byte strided write, using synchronous transfer", length);
       for (size_t row = 0; row < rows; row++)
         this->write_array(ptr + row * stride, row_bytes);
       return true;
     }
 
-    uint8_t *dest = this->async_buffer_;
-    for (size_t row = 0; row < rows; row++) {
-      std::memcpy(dest, ptr + row * stride, row_bytes);
-      dest += row_bytes;
-    }
-    return this->queue_async_buffer_(length);
+    this->copy_async_strided_(ptr, row_bytes, rows, stride);
+    return this->queue_async_blocks_(length);
   }
 
   bool async_busy() override {
@@ -309,46 +328,79 @@ class SPIDelegateHw : public SPIDelegate {
   void read_array(uint8_t *ptr, size_t length) override { this->transfer(nullptr, ptr, length); }
 
  protected:
-  bool ensure_async_buffer_(size_t length) {
-    if (length <= this->async_buffer_size_)
-      return true;
+  bool ensure_async_blocks_(size_t length) {
+    if (length > ASYNC_STAGING_CAPACITY)
+      return false;
 
+    const size_t required_blocks = (length + ASYNC_STAGING_BLOCK_SIZE - 1) / ASYNC_STAGING_BLOCK_SIZE;
     constexpr uint32_t caps = MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL;
-    uint8_t *new_buffer = nullptr;
-    if (this->async_buffer_ == nullptr) {
-      new_buffer = static_cast<uint8_t *>(heap_caps_malloc(length, caps));
-    } else {
-      new_buffer = static_cast<uint8_t *>(heap_caps_realloc(this->async_buffer_, length, caps));
-      if (new_buffer == nullptr) {
-        // On a very tight heap, realloc may be unable to reserve the larger block while the old DMA buffer still
-        // exists. Release the old staging buffer and make one clean attempt at the requested size.
-        heap_caps_free(this->async_buffer_);
-        this->async_buffer_ = nullptr;
-        this->async_buffer_size_ = 0;
-        new_buffer = static_cast<uint8_t *>(heap_caps_malloc(length, caps));
+
+    while (this->async_block_count_ < required_blocks) {
+      auto *block = static_cast<uint8_t *>(heap_caps_malloc(ASYNC_STAGING_BLOCK_SIZE, caps));
+      if (block == nullptr) {
+        ESP_LOGW(TAG, "Failed to allocate DMA staging block %zu/%zu (%zu bytes each)", this->async_block_count_ + 1,
+                 required_blocks, ASYNC_STAGING_BLOCK_SIZE);
+        return false;
       }
+      this->async_blocks_[this->async_block_count_] = block;
+      this->async_block_count_++;
+      ESP_LOGD(TAG, "Async DMA staging pool grew to %zu blocks (%zu bytes retained)", this->async_block_count_,
+               this->async_block_count_ * ASYNC_STAGING_BLOCK_SIZE);
     }
 
-    if (new_buffer == nullptr)
-      return false;
-    this->async_buffer_ = new_buffer;
-    this->async_buffer_size_ = length;
     return true;
   }
 
-  bool queue_async_buffer_(size_t length) {
+  void copy_async_linear_(const uint8_t *ptr, size_t length) {
+    size_t remaining = length;
+    size_t block_index = 0;
+    while (remaining != 0) {
+      const size_t partial = std::min(remaining, ASYNC_STAGING_BLOCK_SIZE);
+      std::memcpy(this->async_blocks_[block_index], ptr, partial);
+      ptr += partial;
+      remaining -= partial;
+      block_index++;
+    }
+  }
+
+  void copy_async_strided_(const uint8_t *ptr, size_t row_bytes, size_t rows, size_t stride) {
+    size_t packed_offset = 0;
+    for (size_t row = 0; row < rows; row++) {
+      const uint8_t *source = ptr + row * stride;
+      size_t row_remaining = row_bytes;
+      while (row_remaining != 0) {
+        const size_t block_index = packed_offset / ASYNC_STAGING_BLOCK_SIZE;
+        const size_t block_offset = packed_offset % ASYNC_STAGING_BLOCK_SIZE;
+        const size_t partial =
+            std::min(row_remaining, ASYNC_STAGING_BLOCK_SIZE - block_offset);
+        std::memcpy(this->async_blocks_[block_index] + block_offset, source, partial);
+        source += partial;
+        row_remaining -= partial;
+        packed_offset += partial;
+      }
+    }
+  }
+
+  bool queue_async_blocks_(size_t length) {
     this->async_count_ = 0;
     this->async_completed_ = 0;
 
-    const uint8_t *data = this->async_buffer_;
     size_t remaining = length;
+    size_t block_index = 0;
     while (remaining != 0) {
-      const size_t partial = std::min(remaining, MAX_TRANSFER_SIZE);
+      const size_t partial = std::min(remaining, ASYNC_STAGING_BLOCK_SIZE);
+      if (this->async_count_ >= ASYNC_QUEUE_SIZE) {
+        ESP_LOGE(TAG, "Async SPI staging exceeded descriptor queue unexpectedly");
+        this->async_active_ = this->async_count_ != 0;
+        this->wait_async();
+        return false;
+      }
+
       auto &desc = this->async_descs_[this->async_count_];
       desc = {};
       desc.length = partial * 8;
       desc.rxlength = 0;
-      desc.tx_buffer = data;
+      desc.tx_buffer = this->async_blocks_[block_index];
 
       const esp_err_t err = spi_device_queue_trans(this->handle_, &desc, portMAX_DELAY);
       if (err != ESP_OK) {
@@ -359,11 +411,11 @@ class SPIDelegateHw : public SPIDelegate {
       }
 
       this->async_count_++;
-      data += partial;
+      block_index++;
       remaining -= partial;
     }
 
-    this->async_active_ = true;
+    this->async_active_ = this->async_count_ != 0;
     return true;
   }
 
@@ -394,8 +446,8 @@ class SPIDelegateHw : public SPIDelegate {
   bool write_only_{false};
 
   std::array<spi_transaction_t, ASYNC_QUEUE_SIZE> async_descs_{};
-  uint8_t *async_buffer_{nullptr};
-  size_t async_buffer_size_{0};
+  std::array<uint8_t *, ASYNC_STAGING_BLOCKS> async_blocks_{};
+  size_t async_block_count_{0};
   size_t async_count_{0};
   size_t async_completed_{0};
   bool async_active_{false};
