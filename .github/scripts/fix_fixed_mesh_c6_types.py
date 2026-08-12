@@ -69,14 +69,4 @@ new = '''    // Keep dirty/bounds math explicitly int32_t. On ESP32-C6, int32_t 
 if old not in s:
     raise SystemExit('target end_frame bounds block not found')
 s = s.replace(old, new, 1)
-
-# The display API takes ints. Narrow only at that boundary after clipping to
-# the physical screen, where the values are guaranteed to fit.
-s = s.replace(
-    '      this->display_->mark_dirty(dirty_x0, dirty_y0, dirty_x1, dirty_y1);',
-    '      this->display_->mark_dirty(static_cast<int>(dirty_x0), static_cast<int>(dirty_y0),\\n'
-    '                                 static_cast<int>(dirty_x1), static_cast<int>(dirty_y1));',
-    1,
-)
-
 p.write_text(s)
