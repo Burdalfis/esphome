@@ -3,9 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <cstring>
 #include <type_traits>
-#include <vector>
 
 #include "suzanne_data.h"
 
@@ -22,7 +20,7 @@ struct SuzanneRenderVertex {
   int16_t cx;
   int16_t cy;
   int16_t cz;
-  uint8_t inv_z;
+  uint16_t inv_z;
 };
 
 static constexpr int16_t SIN_Q15[65] = {
@@ -67,11 +65,13 @@ template<typename DisplayT> SuzanneStats render_suzanne(DisplayT *display, uint8
   if (screen_w <= 0 || screen_h <= 0 || stride <= 0)
     return stats;
 
-  static std::vector<uint8_t> z_buffer;
-  const size_t z_size = static_cast<size_t>(screen_w) * screen_h;
-  if (z_buffer.size() != z_size)
-    z_buffer.resize(z_size);
-  std::memset(z_buffer.data(), 0, z_size);
+  // A full-screen 16-bit Z buffer would cost another 110 kB on this panel. Instead, rasterise the mesh in
+  // eight-scanline bands and reuse this tiny buffer. 320 is enough for either orientation of the 172x320 panel.
+  static constexpr int Z_TILE_ROWS = 8;
+  static constexpr int Z_TILE_MAX_WIDTH = 320;
+  static std::array<uint16_t, Z_TILE_MAX_WIDTH * Z_TILE_ROWS> z_tile{};
+  if (screen_w > Z_TILE_MAX_WIDTH)
+    return stats;
 
   constexpr size_t HALF_VERTS = SUZANNE_HALF_VERTEX_COUNT;
   constexpr size_t TOTAL_VERTS = HALF_VERTS * 2;
@@ -124,9 +124,12 @@ template<typename DisplayT> SuzanneStats render_suzanne(DisplayT *display, uint8
     p.cz = static_cast<int16_t>(z2);
     p.x = static_cast<int16_t>(center_x + static_cast<int32_t>((static_cast<int64_t>(x1) * FOCAL) / depth));
     p.y = static_cast<int16_t>(center_y - static_cast<int32_t>((static_cast<int64_t>(y2) * FOCAL) / depth));
-    int32_t inv_z = 65535 / depth;
-    inv_z = std::clamp<int32_t>(inv_z, 1, 255);
-    p.inv_z = static_cast<uint8_t>(inv_z);
+
+    // 24-bit numerator gives us nearly the full uint16_t range over Suzanne's depth range. Larger reciprocal depth
+    // means closer to the camera, so a simple greater-than comparison implements the depth test.
+    int32_t inv_z = 16777215 / depth;
+    inv_z = std::clamp<int32_t>(inv_z, 1, 65535);
+    p.inv_z = static_cast<uint16_t>(inv_z);
   };
 
   for (size_t i = 0; i < HALF_VERTS; i++) {
@@ -164,8 +167,9 @@ template<typename DisplayT> SuzanneStats render_suzanne(DisplayT *display, uint8
     fill_rect(old_x0, old_y0, old_x1, old_y1, black);
   }
 
-  auto draw_span = [&](int y, int32_t xa, int32_t za, int32_t xb, int32_t zb, PixelT color) {
-    if (y < 0 || y >= screen_h)
+  auto draw_span = [&](int y, int32_t xa, int32_t za, int32_t xb, int32_t zb, PixelT color, int tile_y0,
+                       int tile_y1) {
+    if (y < tile_y0 || y > tile_y1 || y < 0 || y >= screen_h)
       return;
     if (xa > xb) {
       std::swap(xa, xb);
@@ -177,12 +181,19 @@ template<typename DisplayT> SuzanneStats render_suzanne(DisplayT *display, uint8
     if (x1 < 0 || x0 >= screen_w)
       return;
 
-    const int original_span = x1 - x0;
-    int32_t z_step = 0;
-    if (original_span > 0)
-      z_step = (zb - za) / original_span;
-
+    // za/zb are Q24.8 reciprocal depths at the exact Q16.16 edge intersections. Derive the depth at the first
+    // integer pixel from the fractional edge position, then step one pixel at a time. This avoids the large depth
+    // error the old rasteriser introduced by dividing by a truncated integer span width.
     int32_t z = za;
+    int32_t z_step = 0;
+    const int64_t dx_q16 = static_cast<int64_t>(xb) - xa;
+    if (dx_q16 > 0) {
+      const int64_t dz_q8 = static_cast<int64_t>(zb) - za;
+      z_step = static_cast<int32_t>((dz_q8 << 16) / dx_q16);
+      const int64_t x_offset_q16 = (static_cast<int64_t>(x0) << 16) - xa;
+      z = static_cast<int32_t>(static_cast<int64_t>(za) + (dz_q8 * x_offset_q16) / dx_q16);
+    }
+
     if (x0 < 0) {
       z += static_cast<int32_t>(-x0) * z_step;
       x0 = 0;
@@ -193,9 +204,9 @@ template<typename DisplayT> SuzanneStats render_suzanne(DisplayT *display, uint8
       return;
 
     PixelT *pixel = fb + static_cast<size_t>(y) * stride + x0;
-    uint8_t *depth_pixel = z_buffer.data() + static_cast<size_t>(y) * screen_w + x0;
+    uint16_t *depth_pixel = z_tile.data() + static_cast<size_t>(y - tile_y0) * screen_w + x0;
     for (int x = x0; x <= x1; x++, pixel++, depth_pixel++, z += z_step) {
-      const uint8_t iz = static_cast<uint8_t>(std::clamp<int32_t>(z >> 16, 0, 255));
+      const uint16_t iz = static_cast<uint16_t>(std::clamp<int32_t>(z >> 8, 0, 65535));
       if (iz > *depth_pixel) {
         *depth_pixel = iz;
         *pixel = color;
@@ -204,7 +215,7 @@ template<typename DisplayT> SuzanneStats render_suzanne(DisplayT *display, uint8
   };
 
   auto fill_triangle = [&](const SuzanneRenderVertex &va, const SuzanneRenderVertex &vb,
-                           const SuzanneRenderVertex &vc, PixelT color) {
+                           const SuzanneRenderVertex &vc, PixelT color, int tile_y0, int tile_y1) {
     struct ScanVertex {
       int x;
       int y;
@@ -220,30 +231,33 @@ template<typename DisplayT> SuzanneStats render_suzanne(DisplayT *display, uint8
       std::swap(v0, v2);
     if (v2.y < v1.y)
       std::swap(v1, v2);
-    if (v0.y == v2.y)
+    if (v0.y == v2.y || v2.y < tile_y0 || v0.y > tile_y1)
       return;
 
     const int long_dy = v2.y - v0.y;
     const int32_t long_x_step = static_cast<int32_t>((static_cast<int64_t>(v2.x - v0.x) << 16) / long_dy);
-    const int32_t long_z_step = static_cast<int32_t>((static_cast<int64_t>(v2.z - v0.z) << 16) / long_dy);
-    int32_t long_x = v0.x << 16;
-    int32_t long_z = v0.z << 16;
+    const int32_t long_z_step = static_cast<int32_t>((static_cast<int64_t>(v2.z - v0.z) << 8) / long_dy);
 
     if (v1.y > v0.y) {
       const int short_dy = v1.y - v0.y;
       const int32_t short_x_step =
           static_cast<int32_t>((static_cast<int64_t>(v1.x - v0.x) << 16) / short_dy);
-      const int32_t short_z_step =
-          static_cast<int32_t>((static_cast<int64_t>(v1.z - v0.z) << 16) / short_dy);
-      int32_t short_x = v0.x << 16;
-      int32_t short_z = v0.z << 16;
+      const int32_t short_z_step = static_cast<int32_t>((static_cast<int64_t>(v1.z - v0.z) << 8) / short_dy);
       const int top_end = (v1.y == v2.y) ? v1.y : v1.y - 1;
-      for (int y = v0.y; y <= top_end; y++) {
-        draw_span(y, long_x, long_z, short_x, short_z, color);
-        long_x += long_x_step;
-        long_z += long_z_step;
-        short_x += short_x_step;
-        short_z += short_z_step;
+      const int y_start = std::max(v0.y, tile_y0);
+      const int y_end = std::min(top_end, tile_y1);
+      if (y_start <= y_end) {
+        int32_t long_x = (v0.x << 16) + long_x_step * (y_start - v0.y);
+        int32_t long_z = (v0.z << 8) + long_z_step * (y_start - v0.y);
+        int32_t short_x = (v0.x << 16) + short_x_step * (y_start - v0.y);
+        int32_t short_z = (v0.z << 8) + short_z_step * (y_start - v0.y);
+        for (int y = y_start; y <= y_end; y++) {
+          draw_span(y, long_x, long_z, short_x, short_z, color, tile_y0, tile_y1);
+          long_x += long_x_step;
+          long_z += long_z_step;
+          short_x += short_x_step;
+          short_z += short_z_step;
+        }
       }
     }
 
@@ -251,25 +265,34 @@ template<typename DisplayT> SuzanneStats render_suzanne(DisplayT *display, uint8
       const int short_dy = v2.y - v1.y;
       const int32_t short_x_step =
           static_cast<int32_t>((static_cast<int64_t>(v2.x - v1.x) << 16) / short_dy);
-      const int32_t short_z_step =
-          static_cast<int32_t>((static_cast<int64_t>(v2.z - v1.z) << 16) / short_dy);
-      int32_t short_x = v1.x << 16;
-      int32_t short_z = v1.z << 16;
-      for (int y = v1.y; y <= v2.y; y++) {
-        draw_span(y, long_x, long_z, short_x, short_z, color);
-        long_x += long_x_step;
-        long_z += long_z_step;
-        short_x += short_x_step;
-        short_z += short_z_step;
+      const int32_t short_z_step = static_cast<int32_t>((static_cast<int64_t>(v2.z - v1.z) << 8) / short_dy);
+      const int y_start = std::max(v1.y, tile_y0);
+      const int y_end = std::min(v2.y, tile_y1);
+      if (y_start <= y_end) {
+        int32_t long_x = (v0.x << 16) + long_x_step * (y_start - v0.y);
+        int32_t long_z = (v0.z << 8) + long_z_step * (y_start - v0.y);
+        int32_t short_x = (v1.x << 16) + short_x_step * (y_start - v1.y);
+        int32_t short_z = (v1.z << 8) + short_z_step * (y_start - v1.y);
+        for (int y = y_start; y <= y_end; y++) {
+          draw_span(y, long_x, long_z, short_x, short_z, color, tile_y0, tile_y1);
+          long_x += long_x_step;
+          long_z += long_z_step;
+          short_x += short_x_step;
+          short_z += short_z_step;
+        }
       }
     }
   };
 
-  auto render_face = [&](size_t ia, size_t ib, size_t ic, size_t id, bool quad) {
+  auto render_triangle = [&](size_t ia, size_t ib, size_t ic, int tile_y0, int tile_y1) {
     const auto &a = projected[ia];
     const auto &b = projected[ib];
     const auto &c = projected[ic];
-    const auto &d = projected[id];
+
+    const int tri_min_y = std::min<int>(a.y, std::min<int>(b.y, c.y));
+    const int tri_max_y = std::max<int>(a.y, std::max<int>(b.y, c.y));
+    if (tri_max_y < tile_y0 || tri_min_y > tile_y1)
+      return;
 
     const int32_t e1x = b.cx - a.cx;
     const int32_t e1y = b.cy - a.cy;
@@ -281,15 +304,17 @@ template<typename DisplayT> SuzanneStats render_suzanne(DisplayT *display, uint8
     const int32_t ny = e1z * e2x - e1x * e2z;
     const int32_t nz = e1x * e2y - e1y * e2x;
 
-    // Perspective-correct back-face test: outward normal dot vector from camera to face.
     const int64_t view_dot = static_cast<int64_t>(nx) * a.cx + static_cast<int64_t>(ny) * a.cy +
                              static_cast<int64_t>(nz) * (CAMERA_Z + a.cz);
     if (view_dot >= 0)
       return;
 
-    stats.visible_faces++;
+    // Count each visible triangle once, on the first tile it intersects.
+    if ((tri_min_y >= tile_y0 && tri_min_y <= tile_y1) || (tile_y0 == 0 && tri_min_y < 0)) {
+      stats.visible_faces++;
+      stats.rasterized_triangles++;
+    }
 
-    // Fixed camera-space light from upper-left/front. L1 normalisation is cheap and visually adequate for flat shading.
     constexpr int32_t LX = -50;
     constexpr int32_t LY = 80;
     constexpr int32_t LZ = -120;
@@ -302,26 +327,41 @@ template<typename DisplayT> SuzanneStats render_suzanne(DisplayT *display, uint8
       brightness += diffuse;
     }
     const PixelT color = shade_palette[std::clamp(brightness >> 3, 0, 31)];
-
-    fill_triangle(a, b, c, color);
-    stats.rasterized_triangles++;
-    if (quad) {
-      fill_triangle(a, c, d, color);
-      stats.rasterized_triangles++;
-    }
+    fill_triangle(a, b, c, color, tile_y0, tile_y1);
   };
 
-  for (size_t i = 0; i < SUZANNE_HALF_FACE_COUNT; i++) {
-    const int a0 = static_cast<int>(SUZANNE_FACES[i][0]) + static_cast<int>(i) - SUZANNE_OFFSET;
-    const int b0 = static_cast<int>(SUZANNE_FACES[i][1]) + static_cast<int>(i) - SUZANNE_OFFSET;
-    const int c0 = static_cast<int>(SUZANNE_FACES[i][2]) + static_cast<int>(i) - SUZANNE_OFFSET;
-    const int d0 = static_cast<int>(SUZANNE_FACES[i][3]) + static_cast<int>(i) - SUZANNE_OFFSET;
-    const bool quad = SUZANNE_FACES[i][3] != SUZANNE_FACES[i][2];
+  const int render_y0 = std::max(new_y0, 0);
+  const int render_y1 = std::min(new_y1, screen_h - 1);
+  if (render_y0 <= render_y1) {
+    for (int tile_y0 = render_y0; tile_y0 <= render_y1; tile_y0 += Z_TILE_ROWS) {
+      const int tile_y1 = std::min(tile_y0 + Z_TILE_ROWS - 1, render_y1);
+      const size_t tile_pixels = static_cast<size_t>(screen_w) * (tile_y1 - tile_y0 + 1);
+      std::fill_n(z_tile.data(), tile_pixels, static_cast<uint16_t>(0));
 
-    render_face(static_cast<size_t>(a0), static_cast<size_t>(b0), static_cast<size_t>(c0), static_cast<size_t>(d0),
-                quad);
-    render_face(HALF_VERTS + static_cast<size_t>(c0), HALF_VERTS + static_cast<size_t>(b0),
-                HALF_VERTS + static_cast<size_t>(a0), HALF_VERTS + static_cast<size_t>(d0), quad);
+      for (size_t i = 0; i < SUZANNE_HALF_FACE_COUNT; i++) {
+        const int a0 = static_cast<int>(SUZANNE_FACES[i][0]) + static_cast<int>(i) - SUZANNE_OFFSET;
+        const int b0 = static_cast<int>(SUZANNE_FACES[i][1]) + static_cast<int>(i) - SUZANNE_OFFSET;
+        const int c0 = static_cast<int>(SUZANNE_FACES[i][2]) + static_cast<int>(i) - SUZANNE_OFFSET;
+        const int d0 = static_cast<int>(SUZANNE_FACES[i][3]) + static_cast<int>(i) - SUZANNE_OFFSET;
+        const bool quad = SUZANNE_FACES[i][3] != SUZANNE_FACES[i][2];
+
+        const size_t a = static_cast<size_t>(a0);
+        const size_t b = static_cast<size_t>(b0);
+        const size_t c = static_cast<size_t>(c0);
+        const size_t d = static_cast<size_t>(d0);
+        render_triangle(a, b, c, tile_y0, tile_y1);
+        if (quad)
+          render_triangle(a, c, d, tile_y0, tile_y1);
+
+        const size_t ma = HALF_VERTS + c;
+        const size_t mb = HALF_VERTS + b;
+        const size_t mc = HALF_VERTS + a;
+        const size_t md = HALF_VERTS + d;
+        render_triangle(ma, mb, mc, tile_y0, tile_y1);
+        if (quad)
+          render_triangle(ma, mc, md, tile_y0, tile_y1);
+      }
+    }
   }
 
   if (!have_old_box) {
