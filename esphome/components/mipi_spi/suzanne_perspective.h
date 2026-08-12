@@ -32,8 +32,8 @@ struct PerspectiveRenderVertex {
 };
 
 // Recover perspective-correct UV every N pixels, then linearly interpolate UV inside that short block.
-// Four pixels is a good C6 compromise and maps naturally to a tunable quality/performance knob on the S3.
-static constexpr int PERSPECTIVE_BLOCK_PIXELS = 4;
+// Eight pixels is the selected C6 quality/performance compromise from the 2/4/8/16 benchmark sweep.
+static constexpr int PERSPECTIVE_BLOCK_PIXELS = 8;
 static constexpr int PERSPECTIVE_UV_FRAC_BITS = 8;
 static constexpr int PERSPECTIVE_INV_W_BITS = 24;
 
