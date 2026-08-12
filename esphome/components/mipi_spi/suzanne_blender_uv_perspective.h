@@ -58,7 +58,7 @@ static inline const FixedMeshStats &get_suzanne_fixed_mesh_stats() {
 template<typename DisplayT>
 PerspectiveStats render_suzanne_blender_uv_perspective(DisplayT *display, uint8_t phase_x, uint8_t phase_y,
                                                         int32_t camera_z = 500) {
-  static FixedMeshRenderer<DisplayT> renderer;
+  static FixedMeshRenderer<DisplayT, GOURAUD_TOTAL_VERTS> renderer;
   PerspectiveStats stats{};
   if (!renderer.begin_frame(display))
     return stats;

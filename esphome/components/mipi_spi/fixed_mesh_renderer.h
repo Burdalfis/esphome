@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -106,14 +107,19 @@ static inline int32_t fixed_mesh_sin_q15(uint8_t phase) {
 }
 
 struct FixedMeshProjectedVertex {
-  int32_t x;
-  int32_t y;
+  // Screen coordinates only need int16 range; camera-space coordinates stay
+  // int32 so translated/clipped objects remain robust. This keeps the reusable
+  // projected scratch vertex at 24 bytes, matching the old Suzanne path.
+  int16_t x;
+  int16_t y;
   int32_t cx;
   int32_t cy;
   int32_t depth;
-  uint8_t shade;
   int32_t inv_w;
+  uint8_t shade;
 };
+static_assert(sizeof(FixedMeshProjectedVertex) == 24,
+              "Projected fixed-mesh vertex should stay at 24 bytes");
 
 struct FixedMeshRasterVertex {
   int32_t x;
@@ -167,7 +173,7 @@ static inline size_t fixed_mesh_clip_triangle_near(const FixedMeshClipVertex (&i
   return out_count;
 }
 
-template<typename DisplayT> class FixedMeshRenderer {
+template<typename DisplayT, size_t MAX_VERTICES> class FixedMeshRenderer {
  public:
   using PixelT = std::remove_pointer_t<decltype(std::declval<DisplayT *>()->get_framebuffer())>;
   static_assert(sizeof(PixelT) == 2, "FixedMeshRenderer requires a 16-bit framebuffer");
@@ -228,14 +234,11 @@ template<typename DisplayT> class FixedMeshRenderer {
         mesh.triangles == nullptr || mesh.vertex_count == 0 || mesh.triangle_count == 0 ||
         material.texture == nullptr || material.lit_palette_le == nullptr || material.lit_palette_be == nullptr ||
         material.texture_width == 0 || material.texture_height == 0 || material.uv_frac_bits > 16 ||
-        params.near_depth <= 0 || params.focal <= 0)
+        mesh.vertex_count > MAX_VERTICES || params.near_depth <= 0 || params.focal <= 0)
       return;
 
     this->stats_.meshes_drawn++;
     this->stats_.input_triangles += static_cast<uint32_t>(mesh.triangle_count);
-    if (this->projected_.size() < mesh.vertex_count)
-      this->projected_.resize(mesh.vertex_count);
-
     const int32_t sx = fixed_mesh_sin_q15(params.phase_x);
     const int32_t cx = fixed_mesh_sin_q15(static_cast<uint8_t>(params.phase_x + 64));
     const int32_t sy = fixed_mesh_sin_q15(params.phase_y);
@@ -310,8 +313,12 @@ template<typename DisplayT> class FixedMeshRenderer {
       p.shade = shade;
       if (depth >= params.near_depth) {
         p.inv_w = static_cast<int32_t>((int64_t{1} << FIXED_MESH_INV_W_BITS) / depth);
-        p.x = center_x + static_cast<int32_t>((static_cast<int64_t>(camera_x) * params.focal) / depth);
-        p.y = center_y - static_cast<int32_t>((static_cast<int64_t>(camera_y) * params.focal) / depth);
+        const int32_t screen_x = center_x +
+            static_cast<int32_t>((static_cast<int64_t>(camera_x) * params.focal) / depth);
+        const int32_t screen_y = center_y -
+            static_cast<int32_t>((static_cast<int64_t>(camera_y) * params.focal) / depth);
+        p.x = static_cast<int16_t>(std::clamp<int32_t>(screen_x, -32768, 32767));
+        p.y = static_cast<int16_t>(std::clamp<int32_t>(screen_y, -32768, 32767));
       } else {
         p.inv_w = 0;
         p.x = 0;
@@ -709,7 +716,7 @@ template<typename DisplayT> class FixedMeshRenderer {
   uint32_t dma_high_water_bytes_{0};
   FixedMeshStats stats_{};
   std::vector<uint8_t> z_buffer_{};
-  std::vector<FixedMeshProjectedVertex> projected_{};
+  std::array<FixedMeshProjectedVertex, MAX_VERTICES> projected_{};
 };
 
 }  // namespace esphome::mipi_spi::demo3d
