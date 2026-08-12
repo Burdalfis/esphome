@@ -1,0 +1,75 @@
+name: Apply Suzanne near clip
+
+on:
+  push:
+    branches:
+      - agent/c6-async-mipi-dma
+    paths:
+      - .github/workflows/apply-suzanne-near-clip.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/c6-async-mipi-dma
+      - name: Modify renderer
+        run: python3 .github/scripts/add_suzanne_near_clip.py
+      - name: Compile clipping test
+        shell: bash
+        run: |
+          cat >/tmp/near_clip_test.cpp <<'CPP'
+          #include <cstddef>
+          #include <cstdint>
+          namespace esphome { struct Color { constexpr Color(int, int, int) {} }; }
+          #include "esphome/components/mipi_spi/suzanne_blender_uv_perspective.h"
+          using namespace esphome::mipi_spi::demo3d;
+          static_assert(PERSPECTIVE_BLOCK_PIXELS == 8);
+          static_assert(SUZANNE_PERSPECTIVE_NEAR_DEPTH == 256);
+          struct DummyDisplay {
+            uint16_t framebuffer[172 * 320]{};
+            uint16_t *get_framebuffer() { return framebuffer; }
+            int get_width() const { return 172; }
+            int get_height() const { return 320; }
+            std::size_t get_framebuffer_stride() const { return 172; }
+            uint16_t native_color(const esphome::Color &) const { return 0; }
+            void mark_dirty(int, int, int, int) {}
+          };
+          static bool valid(const std::array<SuzanneNearClipVertex, 4> &v, size_t n) {
+            for (size_t i = 0; i < n; i++) if (v[i].depth < 256) return false;
+            return true;
+          }
+          int main() {
+            std::array<SuzanneNearClipVertex, 4> out{};
+            SuzanneNearClipVertex in{0,0,300,128,1000,2000};
+            SuzanneNearClipVertex o{20,10,200,200,3000,4000};
+            std::array<SuzanneNearClipVertex,3> a{{in,in,in}};
+            if (clip_suzanne_triangle_near(a,out) != 3 || !valid(out,3)) return 1;
+            std::array<SuzanneNearClipVertex,3> b{{o,o,o}};
+            if (clip_suzanne_triangle_near(b,out) != 0) return 2;
+            std::array<SuzanneNearClipVertex,3> c{{o,in,in}};
+            if (clip_suzanne_triangle_near(c,out) != 4 || !valid(out,4)) return 3;
+            std::array<SuzanneNearClipVertex,3> d{{o,o,in}};
+            if (clip_suzanne_triangle_near(d,out) != 3 || !valid(out,3)) return 4;
+            DummyDisplay display;
+            auto normal = render_suzanne_blender_uv_perspective(&display,17,29);
+            if (normal.visible_triangles == 0) return 5;
+            (void) render_suzanne_blender_uv_perspective(&display,17,29,0);
+            (void) render_suzanne_blender_uv_perspective(&display,17,29,300);
+            return 0;
+          }
+          CPP
+          g++ -std=c++17 -Wall -Wextra -Werror -I. /tmp/near_clip_test.cpp -o /tmp/near_clip_test
+          /tmp/near_clip_test
+      - name: Commit renderer
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add esphome/components/mipi_spi/suzanne_blender_uv_perspective.h
+          git commit -m "Add near-plane clipping to Suzanne renderer [skip ci]"
+          git push origin HEAD:agent/c6-async-mipi-dma
