@@ -1,0 +1,111 @@
+name: Vendor Suzanne UV atlas
+
+on:
+  push:
+    branches:
+      - agent/c6-async-mipi-dma
+    paths:
+      - .github/workflows/vendor-suzanne-uv.yml
+
+permissions:
+  contents: write
+
+jobs:
+  vendor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/c6-async-mipi-dma
+
+      - name: Generate compact Suzanne UV data
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import urllib.request
+
+          source_url = (
+              "https://raw.githubusercontent.com/blender/blender/"
+              "ec438d7429e51b33ff8958da0c21def018d43835/"
+              "source/blender/bmesh/operators/bmo_primitive.cc"
+          )
+          text = urllib.request.urlopen(source_url, timeout=30).read().decode("utf-8")
+          match = re.search(
+              r"static const float monkeyuvs\[\] = \{\s*(.*?)\s*\};",
+              text,
+              re.S,
+          )
+          if match is None:
+              raise RuntimeError("Could not find Blender monkeyuvs array")
+
+          values = [
+              float(value)
+              for value in re.findall(r"([-+]?(?:\d+\.\d+|\d+))f", match.group(1))
+          ]
+          if len(values) != 1968 * 2:
+              raise RuntimeError(f"Expected 3936 monkey UV floats, got {len(values)}")
+
+          texture_size = 128
+          frac_bits = 7
+          coord_max = (texture_size - 1) << frac_bits
+          pairs = []
+          for i in range(0, len(values), 2):
+              u = values[i]
+              v = values[i + 1]
+              uq = round(u * coord_max)
+              # Blender UVs use bottom-left origin; the framebuffer texture array uses top-left.
+              vq = round((1.0 - v) * coord_max)
+              if not (0 <= uq <= coord_max and 0 <= vq <= coord_max):
+                  raise RuntimeError(f"UV out of range at corner {i // 2}: {(u, v)}")
+              pairs.append((uq, vq))
+
+          out = []
+          out.append("#pragma once")
+          out.append("")
+          out.append("#include <array>")
+          out.append("#include <cstddef>")
+          out.append("#include <cstdint>")
+          out.append("")
+          out.append("namespace esphome::mipi_spi::demo3d {")
+          out.append("")
+          out.append("// Face-corner UV atlas from Blender's Suzanne primitive (monkeyuvs).")
+          out.append("// Blender source: bmo_primitive.cc, GPL-2.0-or-later.")
+          out.append("// Pinned upstream commit: ec438d7429e51b33ff8958da0c21def018d43835")
+          out.append("// Coordinates are pre-quantized to Q7 texel units for a 128x128 texture.")
+          out.append("struct SuzanneBlenderUVQ7 {")
+          out.append("  uint16_t u;")
+          out.append("  uint16_t v;")
+          out.append("};")
+          out.append("")
+          out.append("static constexpr int SUZANNE_BLENDER_TEXTURE_SIZE = 128;")
+          out.append("static constexpr int SUZANNE_BLENDER_UV_FRAC_BITS = 7;")
+          out.append("static constexpr size_t SUZANNE_BLENDER_UV_COUNT = 1968;")
+          out.append("")
+          out.append(
+              "static constexpr std::array<SuzanneBlenderUVQ7, SUZANNE_BLENDER_UV_COUNT> "
+              "SUZANNE_BLENDER_UVS_Q7 = {{"
+          )
+          for start in range(0, len(pairs), 8):
+              row = pairs[start:start + 8]
+              out.append("    " + ", ".join(f"{{{u}, {v}}}" for u, v in row) + ",")
+          out.append("}};")
+          out.append("")
+          out.append("}  // namespace esphome::mipi_spi::demo3d")
+          out.append("")
+
+          dest = Path("esphome/components/mipi_spi/suzanne_blender_uv_data.h")
+          dest.write_text("\n".join(out), encoding="utf-8")
+          print(f"Wrote {dest} with {len(pairs)} face-corner UVs")
+          PY
+
+      - name: Commit generated atlas
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add esphome/components/mipi_spi/suzanne_blender_uv_data.h
+          git diff --cached --quiet && exit 0
+          git commit -m "Vendor Blender Suzanne UV atlas [skip ci]"
+          git push origin HEAD:agent/c6-async-mipi-dma
