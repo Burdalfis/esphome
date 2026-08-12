@@ -28,7 +28,7 @@ static inline uint32_t get_suzanne_perspective_sweep_pass() {
   return SUZANNE_PERSPECTIVE_SWEEP_LAST_PASS;
 }
 
-static constexpr int SUZANNE_BLENDER_TEXTURE_SIZE_64 = 64;
+static constexpr int SUZANNE_SWEEP_TEXTURE_SIZE_64 = 64;
 
 // Blender's artist-authored face-corner UV atlas.
 //
@@ -36,7 +36,7 @@ static constexpr int SUZANNE_BLENDER_TEXTURE_SIZE_64 = 64;
 // vertex can have several UVs at island seams. Shared projected positions and
 // normals therefore remain exactly the same size as the previous renderer; the
 // three face-corner UVs are applied only when a visible triangle is submitted.
-static constexpr size_t suzanne_blender64_expected_uv_count() {
+static constexpr size_t suzanne_blender64_sweep_expected_uv_count() {
   size_t count = 0;
   for (size_t i = 0; i < SUZANNE_HALF_FACE_COUNT; i++) {
     const bool quad = SUZANNE_FACES[i][3] != SUZANNE_FACES[i][2];
@@ -45,33 +45,33 @@ static constexpr size_t suzanne_blender64_expected_uv_count() {
   return count;
 }
 
-static_assert(suzanne_blender64_expected_uv_count() == SUZANNE_BLENDER_UV_COUNT,
+static_assert(suzanne_blender64_sweep_expected_uv_count() == SUZANNE_BLENDER_UV_COUNT,
               "Blender Suzanne UV stream must match the compact mirrored topology");
 
 // 64x64 indexed UV diagnostic texture. This lives entirely in flash. The
 // asymmetric U/V gradient, checker field and 4/16-texel grid lines make island
 // orientation, scale and seams easy to see on the real Blender unwrap.
-static constexpr std::array<uint8_t, SUZANNE_BLENDER_TEXTURE_SIZE_64 * SUZANNE_BLENDER_TEXTURE_SIZE_64>
-make_suzanne_blender_uv_texture_64() {
-  std::array<uint8_t, SUZANNE_BLENDER_TEXTURE_SIZE_64 * SUZANNE_BLENDER_TEXTURE_SIZE_64> texture{};
-  for (int y = 0; y < SUZANNE_BLENDER_TEXTURE_SIZE_64; y++) {
-    for (int x = 0; x < SUZANNE_BLENDER_TEXTURE_SIZE_64; x++) {
-      int index = 28 + (x * 70) / (SUZANNE_BLENDER_TEXTURE_SIZE_64 - 1) +
-                  (y * 30) / (SUZANNE_BLENDER_TEXTURE_SIZE_64 - 1);
+static constexpr std::array<uint8_t, SUZANNE_SWEEP_TEXTURE_SIZE_64 * SUZANNE_SWEEP_TEXTURE_SIZE_64>
+make_suzanne_blender_uv_texture_64_sweep() {
+  std::array<uint8_t, SUZANNE_SWEEP_TEXTURE_SIZE_64 * SUZANNE_SWEEP_TEXTURE_SIZE_64> texture{};
+  for (int y = 0; y < SUZANNE_SWEEP_TEXTURE_SIZE_64; y++) {
+    for (int x = 0; x < SUZANNE_SWEEP_TEXTURE_SIZE_64; x++) {
+      int index = 28 + (x * 70) / (SUZANNE_SWEEP_TEXTURE_SIZE_64 - 1) +
+                  (y * 30) / (SUZANNE_SWEEP_TEXTURE_SIZE_64 - 1);
       if ((((x >> 3) ^ (y >> 3)) & 1) != 0)
         index += 40;
       if ((x & 3) == 0 || (y & 3) == 0)
         index = 205;
       if ((x & 15) == 0 || (y & 15) == 0)
         index = 250;
-      texture[static_cast<size_t>(y) * SUZANNE_BLENDER_TEXTURE_SIZE_64 + x] =
+      texture[static_cast<size_t>(y) * SUZANNE_SWEEP_TEXTURE_SIZE_64 + x] =
           static_cast<uint8_t>(index);
     }
   }
   return texture;
 }
 
-static constexpr auto SUZANNE_BLENDER_UV_TEXTURE_64 = make_suzanne_blender_uv_texture_64();
+static constexpr auto SUZANNE_BLENDER_UV_TEXTURE_64_SWEEP = make_suzanne_blender_uv_texture_64_sweep();
 
 template<typename DisplayT>
 PerspectiveStats render_suzanne_blender_uv_perspective_64_sweep(DisplayT *display, uint8_t phase_x, uint8_t phase_y) {
@@ -291,10 +291,10 @@ PerspectiveStats render_suzanne_blender_uv_perspective_64_sweep(DisplayT *displa
             static_cast<uint8_t>(std::clamp<int32_t>(inv_w >> (PERSPECTIVE_INV_W_BITS - 16), 0, 255));
         if (iz > *depth_pixel) {
           *depth_pixel = iz;
-          const int tex_u = std::clamp<int32_t>(u >> 17, 0, SUZANNE_BLENDER_TEXTURE_SIZE_64 - 1);
-          const int tex_v = std::clamp<int32_t>(v >> 17, 0, SUZANNE_BLENDER_TEXTURE_SIZE_64 - 1);
-          const uint8_t texel = SUZANNE_BLENDER_UV_TEXTURE_64[
-              static_cast<size_t>(tex_v) * SUZANNE_BLENDER_TEXTURE_SIZE_64 + tex_u];
+          const int tex_u = std::clamp<int32_t>(u >> 17, 0, SUZANNE_SWEEP_TEXTURE_SIZE_64 - 1);
+          const int tex_v = std::clamp<int32_t>(v >> 17, 0, SUZANNE_SWEEP_TEXTURE_SIZE_64 - 1);
+          const uint8_t texel = SUZANNE_BLENDER_UV_TEXTURE_64_SWEEP[
+              static_cast<size_t>(tex_v) * SUZANNE_SWEEP_TEXTURE_SIZE_64 + tex_u];
           const uint8_t shade8 = static_cast<uint8_t>(std::clamp<int32_t>(shade >> 16, 0, 255));
           const uint8_t light = static_cast<uint8_t>(shade8 >> 4);
           *pixel = static_cast<PixelT>(lit_palette[static_cast<size_t>(light) * TG_PALETTE_SIZE + texel]);
