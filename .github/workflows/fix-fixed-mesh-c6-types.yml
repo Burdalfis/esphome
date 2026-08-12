@@ -1,0 +1,36 @@
+name: Fix fixed mesh C6 types
+
+on:
+  push:
+    branches:
+      - agent/c6-async-mipi-dma
+    paths:
+      - '.github/workflows/fix-fixed-mesh-c6-types.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/c6-async-mipi-dma
+
+      - name: Apply C6 bounds type fix
+        run: python3 .github/scripts/fix_fixed_mesh_c6_types.py
+
+      - name: Check repaired bounds block
+        run: |
+          grep -F 'int32_t dirty_x0 = 0;' esphome/components/mipi_spi/fixed_mesh_renderer.h
+          grep -F 'std::min<int32_t>(raw_x0, this->new_x0_)' esphome/components/mipi_spi/fixed_mesh_renderer.h
+          grep -F 'std::min<int32_t>(screen_x1, this->new_x1_)' esphome/components/mipi_spi/fixed_mesh_renderer.h
+
+      - name: Commit runtime fix
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add esphome/components/mipi_spi/fixed_mesh_renderer.h
+          git commit -m 'Fix C6 fixed-mesh bounds integer types [skip ci]'
+          git push origin HEAD:agent/c6-async-mipi-dma
