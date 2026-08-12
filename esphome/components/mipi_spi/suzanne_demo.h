@@ -25,6 +25,18 @@ struct SuzanneRenderVertex {
   uint8_t inv_z;
 };
 
+struct SuzanneModelVertex {
+  int16_t x;
+  int16_t y;
+  int16_t z;
+};
+
+struct SuzanneNormal {
+  int16_t x;
+  int16_t y;
+  int16_t z;
+};
+
 static constexpr int16_t SIN_Q15[65] = {
       0,   804,  1608,  2410,  3212,  4011,  4808,  5602,
    6393,  7179,  7962,  8739,  9512, 10278, 11039, 11793,
@@ -52,6 +64,26 @@ static inline int32_t sin_q15(uint8_t phase) {
   }
 }
 
+// Integer square root used only during the one-time model-normal setup. Keeping this integer avoids pulling software
+// floating-point square-root into the C6 benchmark while still giving each triangle a true Euclidean unit normal.
+static inline uint32_t integer_sqrt_u64(uint64_t value) {
+  uint64_t result = 0;
+  uint64_t bit = uint64_t{1} << 62;
+  while (bit > value)
+    bit >>= 2;
+
+  while (bit != 0) {
+    if (value >= result + bit) {
+      value -= result + bit;
+      result = (result >> 1) + bit;
+    } else {
+      result >>= 1;
+    }
+    bit >>= 2;
+  }
+  return static_cast<uint32_t>(result);
+}
+
 template<typename DisplayT> SuzanneStats render_suzanne(DisplayT *display, uint8_t phase_x, uint8_t phase_y) {
   using PixelT = std::remove_pointer_t<decltype(display->get_framebuffer())>;
   static_assert(sizeof(PixelT) == 2, "Suzanne demo expects a 16-bit framebuffer");
@@ -75,16 +107,91 @@ template<typename DisplayT> SuzanneStats render_suzanne(DisplayT *display, uint8
 
   constexpr size_t HALF_VERTS = SUZANNE_HALF_VERTEX_COUNT;
   constexpr size_t TOTAL_VERTS = HALF_VERTS * 2;
+  constexpr size_t NORMALS_PER_HALF_FACE = 4;
+  static std::array<SuzanneModelVertex, TOTAL_VERTS> model_vertices{};
   static std::array<SuzanneRenderVertex, TOTAL_VERTS> projected{};
+  static std::array<SuzanneNormal, SUZANNE_HALF_FACE_COUNT * NORMALS_PER_HALF_FACE> model_normals{};
+  static bool geometry_ready = false;
+
+  // Suzanne's native Blender axes are X right, Y depth and Z up, with the face toward -Y.
+  // Convert them to our camera basis with a proper rotation (determinant +1), not a reflection:
+  // render X = -source X, render Y = source Z, render Z = source Y.
+  if (!geometry_ready) {
+    for (size_t i = 0; i < HALF_VERTS; i++) {
+      const int32_t source_x = static_cast<int32_t>(SUZANNE_VERTICES[i][0]) + 127;
+      const int32_t source_y = static_cast<int32_t>(SUZANNE_VERTICES[i][1]);
+      const int32_t source_z = static_cast<int32_t>(SUZANNE_VERTICES[i][2]);
+
+      model_vertices[i] = {static_cast<int16_t>(-source_x), static_cast<int16_t>(source_z),
+                           static_cast<int16_t>(source_y)};
+      model_vertices[HALF_VERTS + i] = {static_cast<int16_t>(source_x), static_cast<int16_t>(source_z),
+                                        static_cast<int16_t>(source_y)};
+    }
+
+    auto make_normal = [&](size_t ia, size_t ib, size_t ic) -> SuzanneNormal {
+      const auto &a = model_vertices[ia];
+      const auto &b = model_vertices[ib];
+      const auto &c = model_vertices[ic];
+      const int64_t e1x = static_cast<int32_t>(b.x) - a.x;
+      const int64_t e1y = static_cast<int32_t>(b.y) - a.y;
+      const int64_t e1z = static_cast<int32_t>(b.z) - a.z;
+      const int64_t e2x = static_cast<int32_t>(c.x) - a.x;
+      const int64_t e2y = static_cast<int32_t>(c.y) - a.y;
+      const int64_t e2z = static_cast<int32_t>(c.z) - a.z;
+      const int64_t nx = e1y * e2z - e1z * e2y;
+      const int64_t ny = e1z * e2x - e1x * e2z;
+      const int64_t nz = e1x * e2y - e1y * e2x;
+      const uint64_t magnitude_sq = static_cast<uint64_t>(nx * nx + ny * ny + nz * nz);
+      const uint32_t magnitude = integer_sqrt_u64(magnitude_sq);
+      if (magnitude == 0)
+        return SuzanneNormal{0, 0, 0};
+
+      auto normalise = [&](int64_t component) -> int16_t {
+        const int64_t scaled = (component * 32767) / magnitude;
+        return static_cast<int16_t>(std::clamp<int64_t>(scaled, -32767, 32767));
+      };
+      return SuzanneNormal{normalise(nx), normalise(ny), normalise(nz)};
+    };
+
+    for (size_t i = 0; i < SUZANNE_HALF_FACE_COUNT; i++) {
+      const int a0 = static_cast<int>(SUZANNE_FACES[i][0]) + static_cast<int>(i) - SUZANNE_OFFSET;
+      const int b0 = static_cast<int>(SUZANNE_FACES[i][1]) + static_cast<int>(i) - SUZANNE_OFFSET;
+      const int c0 = static_cast<int>(SUZANNE_FACES[i][2]) + static_cast<int>(i) - SUZANNE_OFFSET;
+      const int d0 = static_cast<int>(SUZANNE_FACES[i][3]) + static_cast<int>(i) - SUZANNE_OFFSET;
+      const bool quad = SUZANNE_FACES[i][3] != SUZANNE_FACES[i][2];
+
+      const size_t a = static_cast<size_t>(a0);
+      const size_t b = static_cast<size_t>(b0);
+      const size_t c = static_cast<size_t>(c0);
+      const size_t d = static_cast<size_t>(d0);
+      const size_t base = i * NORMALS_PER_HALF_FACE;
+
+      model_normals[base + 0] = make_normal(a, b, c);
+      model_normals[base + 1] = quad ? make_normal(a, c, d) : SuzanneNormal{};
+
+      const size_t ma = HALF_VERTS + c;
+      const size_t mb = HALF_VERTS + b;
+      const size_t mc = HALF_VERTS + a;
+      const size_t md = HALF_VERTS + d;
+      model_normals[base + 2] = make_normal(ma, mb, mc);
+      model_normals[base + 3] = quad ? make_normal(ma, mc, md) : SuzanneNormal{};
+    }
+    geometry_ready = true;
+  }
 
   const PixelT black = display->native_color(Color(0, 0, 0));
 
-  std::array<PixelT, 32> shade_palette{};
-  for (int i = 0; i < 32; i++) {
-    const int level = (i * 255 + 15) / 31;
-    shade_palette[i] = display->native_color(
-        Color(static_cast<uint8_t>((70 * level) / 255), static_cast<uint8_t>((185 * level) / 255),
-              static_cast<uint8_t>((255 * level) / 255)));
+  // 256 levels eliminate the visible 5-bit lighting steps from the original benchmark. Build the native RGB565
+  // palette once; per-triangle shading is then only a table lookup.
+  static std::array<PixelT, 256> shade_palette{};
+  static bool palette_ready = false;
+  if (!palette_ready) {
+    for (int level = 0; level < 256; level++) {
+      shade_palette[level] = display->native_color(
+          Color(static_cast<uint8_t>((70 * level) / 255), static_cast<uint8_t>((185 * level) / 255),
+                static_cast<uint8_t>(level)));
+    }
+    palette_ready = true;
   }
 
   auto fill_rect = [&](int x0, int y0, int x1, int y1, PixelT color) {
@@ -104,16 +211,15 @@ template<typename DisplayT> SuzanneStats render_suzanne(DisplayT *display, uint8
   const int32_t sy = sin_q15(phase_y);
   const int32_t cy = sin_q15(static_cast<uint8_t>(phase_y + 64));
 
-  // Suzanne's native Blender axes are X right, Y depth and Z up, with the face toward -Y.
-  // Convert them to our camera basis with a proper rotation (determinant +1), not a reflection:
-  // render X = -source X, render Y = source Z, render Z = source Y.
-  // The X flip is visually irrelevant for symmetric Suzanne, while keeping triangle winding and normals correct.
   constexpr int32_t CAMERA_Z = 500;
   constexpr int32_t FOCAL = 220;
   const int center_x = screen_w / 2;
   const int center_y = screen_h / 2;
 
-  auto transform_vertex = [&](size_t out_index, int32_t x, int32_t y, int32_t z) {
+  auto transform_vertex = [&](size_t out_index, const SuzanneModelVertex &m) {
+    const int32_t x = m.x;
+    const int32_t y = m.y;
+    const int32_t z = m.z;
     const int32_t x1 = static_cast<int32_t>((static_cast<int64_t>(x) * cy + static_cast<int64_t>(z) * sy) >> 15);
     const int32_t z1 = static_cast<int32_t>((-static_cast<int64_t>(x) * sy + static_cast<int64_t>(z) * cy) >> 15);
     const int32_t y2 = static_cast<int32_t>((static_cast<int64_t>(y) * cx - static_cast<int64_t>(z1) * sx) >> 15);
@@ -131,15 +237,8 @@ template<typename DisplayT> SuzanneStats render_suzanne(DisplayT *display, uint8
     p.inv_z = static_cast<uint8_t>(inv_z);
   };
 
-  for (size_t i = 0; i < HALF_VERTS; i++) {
-    const int32_t source_x = static_cast<int32_t>(SUZANNE_VERTICES[i][0]) + 127;
-    const int32_t source_y = static_cast<int32_t>(SUZANNE_VERTICES[i][1]);
-    const int32_t source_z = static_cast<int32_t>(SUZANNE_VERTICES[i][2]);
-
-    // Apply the same orientation-preserving basis transform to both the stored half and its mirrored source vertex.
-    transform_vertex(i, -source_x, source_z, source_y);
-    transform_vertex(HALF_VERTS + i, source_x, source_z, source_y);
-  }
+  for (size_t i = 0; i < TOTAL_VERTS; i++)
+    transform_vertex(i, model_vertices[i]);
 
   int new_x0 = projected[0].x;
   int new_x1 = projected[0].x;
@@ -269,23 +368,35 @@ template<typename DisplayT> SuzanneStats render_suzanne(DisplayT *display, uint8
     }
   };
 
-  auto render_face = [&](size_t ia, size_t ib, size_t ic, size_t id, bool quad) {
+  auto rotate_normal = [&](const SuzanneNormal &normal, int32_t &nx, int32_t &ny, int32_t &nz) {
+    const int32_t x1 = static_cast<int32_t>((static_cast<int64_t>(normal.x) * cy +
+                                             static_cast<int64_t>(normal.z) * sy) >>
+                                            15);
+    const int32_t z1 = static_cast<int32_t>((-static_cast<int64_t>(normal.x) * sy +
+                                             static_cast<int64_t>(normal.z) * cy) >>
+                                            15);
+    nx = x1;
+    ny = static_cast<int32_t>((static_cast<int64_t>(normal.y) * cx - static_cast<int64_t>(z1) * sx) >> 15);
+    nz = static_cast<int32_t>((static_cast<int64_t>(normal.y) * sx + static_cast<int64_t>(z1) * cx) >> 15);
+  };
+
+  // Unit camera-space light in Q15, equivalent to the original (-50, 80, -120) direction.
+  constexpr int32_t LIGHT_X_Q15 = -10733;
+  constexpr int32_t LIGHT_Y_Q15 = 17173;
+  constexpr int32_t LIGHT_Z_Q15 = -25760;
+
+  auto render_triangle = [&](size_t ia, size_t ib, size_t ic, const SuzanneNormal &model_normal) {
     const auto &a = projected[ia];
     const auto &b = projected[ib];
     const auto &c = projected[ic];
-    const auto &d = projected[id];
 
-    const int32_t e1x = b.cx - a.cx;
-    const int32_t e1y = b.cy - a.cy;
-    const int32_t e1z = b.cz - a.cz;
-    const int32_t e2x = c.cx - a.cx;
-    const int32_t e2y = c.cy - a.cy;
-    const int32_t e2z = c.cz - a.cz;
-    const int32_t nx = e1y * e2z - e1z * e2y;
-    const int32_t ny = e1z * e2x - e1x * e2z;
-    const int32_t nz = e1x * e2y - e1y * e2x;
+    int32_t nx;
+    int32_t ny;
+    int32_t nz;
+    rotate_normal(model_normal, nx, ny, nz);
 
-    // With the handedness-preserving source->camera transform above, Blender's winding still produces outward normals.
+    // Cull each constituent triangle independently. This matters for Suzanne's slightly non-planar quads near
+    // grazing angles; using ABC's normal to cull both ABC and ACD could remove a still-front-facing second triangle.
     const int64_t view_dot = static_cast<int64_t>(nx) * a.cx + static_cast<int64_t>(ny) * a.cy +
                              static_cast<int64_t>(nz) * (CAMERA_Z + a.cz);
     if (view_dot >= 0)
@@ -293,26 +404,16 @@ template<typename DisplayT> SuzanneStats render_suzanne(DisplayT *display, uint8
 
     stats.visible_faces++;
 
-    // Fixed camera-space light from upper-left/front. L1 normalisation is cheap and visually adequate for flat shading.
-    constexpr int32_t LX = -50;
-    constexpr int32_t LY = 80;
-    constexpr int32_t LZ = -120;
-    const int64_t light_dot = static_cast<int64_t>(nx) * LX + static_cast<int64_t>(ny) * LY +
-                              static_cast<int64_t>(nz) * LZ;
-    const int64_t norm_l1 = static_cast<int64_t>(std::abs(nx)) + std::abs(ny) + std::abs(nz);
-    int brightness = 48;
-    if (light_dot > 0 && norm_l1 != 0) {
-      const int diffuse = static_cast<int>(std::min<int64_t>(207, (light_dot * 207) / (norm_l1 * 120)));
-      brightness += diffuse;
-    }
-    const PixelT color = shade_palette[std::clamp(brightness >> 3, 0, 31)];
+    const int64_t light_dot_q30 = static_cast<int64_t>(nx) * LIGHT_X_Q15 +
+                                  static_cast<int64_t>(ny) * LIGHT_Y_Q15 +
+                                  static_cast<int64_t>(nz) * LIGHT_Z_Q15;
+    const int32_t diffuse_q15 =
+        static_cast<int32_t>(std::clamp<int64_t>(light_dot_q30 >> 15, 0, 32767));
+    const int brightness = std::clamp(48 + static_cast<int>((static_cast<int64_t>(diffuse_q15) * 207 + 16384) >> 15),
+                                      0, 255);
 
-    fill_triangle(a, b, c, color);
+    fill_triangle(a, b, c, shade_palette[brightness]);
     stats.rasterized_triangles++;
-    if (quad) {
-      fill_triangle(a, c, d, color);
-      stats.rasterized_triangles++;
-    }
   };
 
   for (size_t i = 0; i < SUZANNE_HALF_FACE_COUNT; i++) {
@@ -322,10 +423,23 @@ template<typename DisplayT> SuzanneStats render_suzanne(DisplayT *display, uint8
     const int d0 = static_cast<int>(SUZANNE_FACES[i][3]) + static_cast<int>(i) - SUZANNE_OFFSET;
     const bool quad = SUZANNE_FACES[i][3] != SUZANNE_FACES[i][2];
 
-    render_face(static_cast<size_t>(a0), static_cast<size_t>(b0), static_cast<size_t>(c0), static_cast<size_t>(d0),
-                quad);
-    render_face(HALF_VERTS + static_cast<size_t>(c0), HALF_VERTS + static_cast<size_t>(b0),
-                HALF_VERTS + static_cast<size_t>(a0), HALF_VERTS + static_cast<size_t>(d0), quad);
+    const size_t a = static_cast<size_t>(a0);
+    const size_t b = static_cast<size_t>(b0);
+    const size_t c = static_cast<size_t>(c0);
+    const size_t d = static_cast<size_t>(d0);
+    const size_t base = i * NORMALS_PER_HALF_FACE;
+
+    render_triangle(a, b, c, model_normals[base + 0]);
+    if (quad)
+      render_triangle(a, c, d, model_normals[base + 1]);
+
+    const size_t ma = HALF_VERTS + c;
+    const size_t mb = HALF_VERTS + b;
+    const size_t mc = HALF_VERTS + a;
+    const size_t md = HALF_VERTS + d;
+    render_triangle(ma, mb, mc, model_normals[base + 2]);
+    if (quad)
+      render_triangle(ma, mc, md, model_normals[base + 3]);
   }
 
   if (!have_old_box) {
