@@ -1,0 +1,82 @@
+name: Lock perspective correction to 8 pixels
+
+on:
+  push:
+    branches:
+      - agent/c6-async-mipi-dma
+    paths:
+      - .github/workflows/lock-perspective-block-8.yml
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/c6-async-mipi-dma
+
+      - name: Set shared perspective block size to 8
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('esphome/components/mipi_spi/suzanne_perspective.h')
+          s = p.read_text()
+          old = '''// Recover perspective-correct UV every N pixels, then linearly interpolate UV inside that short block.\n// Four pixels is a good C6 compromise and maps naturally to a tunable quality/performance knob on the S3.\nstatic constexpr int PERSPECTIVE_BLOCK_PIXELS = 4;'''
+          new = '''// Recover perspective-correct UV every N pixels, then linearly interpolate UV inside that short block.\n// Eight pixels is the selected C6 quality/performance compromise from the 2/4/8/16 benchmark sweep.\nstatic constexpr int PERSPECTIVE_BLOCK_PIXELS = 8;'''
+          if old not in s:
+              raise SystemExit('expected perspective block definition not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+      - name: Strict C++17 compile test
+        shell: bash
+        run: |
+          cat >/tmp/perspective8_test.cpp <<'CPP'
+          #include <cstddef>
+          #include <cstdint>
+
+          namespace esphome {
+          struct Color {
+            constexpr Color(int, int, int) {}
+          };
+          }
+
+          #include "esphome/components/mipi_spi/suzanne_perspective.h"
+          #include "esphome/components/mipi_spi/suzanne_blender_uv_perspective_64.h"
+
+          static_assert(esphome::mipi_spi::demo3d::PERSPECTIVE_BLOCK_PIXELS == 8,
+                        "Perspective correction block must be locked to 8 pixels");
+
+          struct DummyDisplay {
+            uint16_t framebuffer[172 * 320]{};
+            uint16_t *get_framebuffer() { return framebuffer; }
+            int get_width() const { return 172; }
+            int get_height() const { return 320; }
+            std::size_t get_framebuffer_stride() const { return 172; }
+            uint16_t native_color(const esphome::Color &) const { return 0; }
+            void mark_dirty(int, int, int, int) {}
+          };
+
+          int main() {
+            DummyDisplay display;
+            auto a = esphome::mipi_spi::demo3d::render_suzanne_perspective(&display, 17, 29);
+            auto b = esphome::mipi_spi::demo3d::render_suzanne_blender_uv_perspective_64(&display, 17, 29);
+            return (a.visible_triangles == 0 || b.visible_triangles == 0) ? 1 : 0;
+          }
+          CPP
+          g++ -std=c++17 -Wall -Wextra -Werror -I. /tmp/perspective8_test.cpp -o /tmp/perspective8_test
+          /tmp/perspective8_test
+
+      - name: Commit change
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add esphome/components/mipi_spi/suzanne_perspective.h
+          git diff --cached --quiet && exit 0
+          git commit -m "Use 8-pixel perspective correction blocks [skip ci]"
+          git push origin HEAD:agent/c6-async-mipi-dma
