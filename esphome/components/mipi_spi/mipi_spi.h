@@ -552,28 +552,17 @@ class MipiSpiBuffer
     const int h = this->y_high_ - this->y_low_ + 1;
     const size_t row_bytes = w * sizeof(BUFFERTYPE);
     const size_t stride_bytes = round_buffer(this->get_width_internal()) * sizeof(BUFFERTYPE);
-    const size_t total_bytes = row_bytes * h;
     const auto *source = reinterpret_cast<const uint8_t *>(
         this->buffer_ + this->y_low_ * round_buffer(this->get_width_internal()) + this->x_low_);
 
-    const uint8_t *send_ptr = source;
-    if (row_bytes != stride_bytes) {
-      this->async_pack_.resize(total_bytes);
-      for (int y = 0; y < h; y++) {
-        std::memcpy(this->async_pack_.data() + y * row_bytes, source + y * stride_bytes, row_bytes);
-      }
-      send_ptr = this->async_pack_.data();
-    }
-
     this->set_addr_window_(this->x_low_, this->y_low_, this->x_high_, this->y_high_);
     this->enable();
-    const bool queued = this->write_array_async(send_ptr, total_bytes);
+    const bool queued = this->write_array_async_strided(source, row_bytes, h, stride_bytes);
     if (!queued) {
       this->disable();
       return false;
     }
 
-    this->async_pack_.clear();
     this->x_low_ = this->get_width_internal();
     this->y_low_ = this->get_height_internal();
     this->x_high_ = 0;
@@ -709,7 +698,6 @@ class MipiSpiBuffer
   uint16_t start_line_{0};
   uint16_t end_line_{1};
   bool async_transaction_open_{false};
-  std::vector<uint8_t> async_pack_{};
 };
 
 }  // namespace esphome::mipi_spi
