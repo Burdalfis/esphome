@@ -251,6 +251,20 @@ class SPIDelegate {
     return true;
   }
 
+  // Queue rows from a strided source. Hardware backends can pack directly into DMA-safe memory; the generic
+  // fallback writes each row synchronously so existing backends remain compatible without an intermediate buffer.
+  virtual bool write_array_async_strided(const uint8_t *ptr, size_t row_bytes, size_t rows, size_t stride) {
+    if (row_bytes == 0 || rows == 0)
+      return true;
+    if (stride < row_bytes)
+      return false;
+    if (stride == row_bytes)
+      return this->write_array_async(ptr, row_bytes * rows);
+    for (size_t row = 0; row < rows; row++)
+      this->write_array(ptr + row * stride, row_bytes);
+    return true;
+  }
+
   // Poll whether a previously queued asynchronous write is still active.
   virtual bool async_busy() { return false; }
 
@@ -518,6 +532,10 @@ class SPIDevice : public SPIClient {
   void write_array(const uint8_t *data, size_t length) { this->delegate_->write_array(data, length); }
 
   bool write_array_async(const uint8_t *data, size_t length) { return this->delegate_->write_array_async(data, length); }
+
+  bool write_array_async_strided(const uint8_t *data, size_t row_bytes, size_t rows, size_t stride) {
+    return this->delegate_->write_array_async_strided(data, row_bytes, rows, stride);
+  }
 
   bool async_busy() { return this->delegate_->async_busy(); }
 
