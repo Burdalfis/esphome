@@ -1,0 +1,66 @@
+name: tmp-pin-fb0-before-recovery
+
+on:
+  push:
+    branches:
+      - agent/c6-async-mipi-dma
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/c6-async-mipi-dma
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply FB0 recovery patch
+        run: python .github/tmp_pin_fb0_before_recovery.py
+      - name: Install ESPHome checkout
+        run: pip install -e .
+      - name: Write direct EDMA test config
+        run: |
+          cat > /tmp/s3-direct-recovery-test.yaml <<'EOF'
+          esphome:
+            name: s3-direct-recovery-test
+            includes:
+              - <esphome/components/fixed_mesh_3d/suzanne_blender_uv_perspective.h>
+          esp32:
+            board: esp32-s3-devkitc-1
+            framework:
+              type: esp-idf
+              advanced:
+                execute_from_psram: true
+          logger:
+          psram:
+            mode: octal
+            speed: 80MHz
+          i2c:
+            sda: GPIO8
+            scl: GPIO9
+          ch422g:
+          fixed_mesh_3d:
+          display:
+            - platform: mipi_rgb
+              model: ESP32-S3-TOUCH-LCD-7-800X480
+              id: lcd_display
+              pclk_frequency: 16MHz
+              bounce_buffer_lines: 0
+              auto_clear_enabled: false
+              update_interval: 10ms
+              lambda: |-
+                esphome::mipi_spi::demo3d::benchmark_suzanne_pclk(id(lcd_display), 500);
+          EOF
+      - name: Compile direct EDMA mode
+        run: python -m esphome compile /tmp/s3-direct-recovery-test.yaml
+      - name: Commit source change
+        run: |
+          git config user.name Burdalfis
+          git config user.email xelastlaurent@gmail.com
+          git add esphome/components/mipi_rgb/mipi_rgb.cpp
+          git commit -m 'Pin S3 direct recovery to framebuffer 0 [skip ci]'
+          git push origin HEAD:agent/c6-async-mipi-dma
