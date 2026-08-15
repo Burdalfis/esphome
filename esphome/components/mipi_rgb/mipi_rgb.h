@@ -51,9 +51,6 @@ class MipiRgb : public display::Display {
   int get_width() override;
   int get_height() override;
 
-  // Direct access to the ESP-IDF RGB scanout framebuffer for performance-sensitive
-  // renderers. The direct path currently requires rotation 0 so logical screen
-  // coordinates and the physical framebuffer stride are identical.
   uint16_t *get_framebuffer();
   size_t get_framebuffer_stride();
   uint16_t native_color(const Color &color);
@@ -71,7 +68,6 @@ class MipiRgb : public display::Display {
   void dump_config() override;
   void draw_pixel_at(int x, int y, Color color) override;
 
-  // this will be horribly slow.
  protected:
   void write_to_display_(int x_start, int y_start, int w, int h, const uint8_t *ptr, int x_offset, int y_offset,
                          int x_pad);
@@ -108,8 +104,13 @@ class MipiRgb : public display::Display {
   uint16_t y_high_{0};
 
   esp_lcd_panel_handle_t handle_{};
-  uint16_t *panel_framebuffers_[2]{nullptr, nullptr};
+  uint16_t *panel_framebuffers_[3]{nullptr, nullptr, nullptr};
+  uint8_t scanout_framebuffer_index_{0};
   uint8_t render_framebuffer_index_{1};
+  uint8_t free_framebuffer_index_{2};
+  uint8_t pending_framebuffer_index_{0xFF};
+  volatile uint32_t frame_done_count_{0};
+  uint32_t pending_frame_done_count_{0};
   SemaphoreHandle_t frame_done_sem_{nullptr};
   bool direct_present_failed_{false};
 };
