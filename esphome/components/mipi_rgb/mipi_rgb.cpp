@@ -17,15 +17,12 @@ static constexpr uint8_t MIPI_RGB_NO_FRAMEBUFFER = 0xFF;
 // Maximum bytes to log for init commands (truncated if larger)
 static constexpr size_t MIPI_RGB_MAX_CMD_LOG_BYTES = 64;
 
-// ESP32-S3 RGB panels stream their framebuffer from PSRAM through internal-RAM
-// bounce buffers. Give the S3 twenty scanlines of headroom so short cache/PSRAM
-// stalls are less likely to starve the LCD DMA. Three PSRAM framebuffers let
-// rendering overlap scanout without forcing the producer to wait at every VSYNC.
+// Three S3 PSRAM framebuffers let rendering overlap scanout. Bounce-buffer depth
+// is configurable per display: 0 selects direct PSRAM -> RGB EDMA, while a
+// non-zero line count uses the two internal-DRAM bounce buffers.
 #if defined(USE_ESP32_VARIANT_ESP32S3)
-static constexpr size_t MIPI_RGB_BOUNCE_BUFFER_LINES = 20;
 static constexpr size_t MIPI_RGB_FRAMEBUFFER_COUNT = 3;
 #else
-static constexpr size_t MIPI_RGB_BOUNCE_BUFFER_LINES = 10;
 static constexpr size_t MIPI_RGB_FRAMEBUFFER_COUNT = 1;
 #endif
 static constexpr uint8_t MADCTL_MY = 0x80;     // Bit 7 Bottom to top
@@ -144,7 +141,7 @@ void MipiRgb::setup() {
 void MipiRgb::common_setup_() {
   esp_lcd_rgb_panel_config_t config{};
   config.flags.fb_in_psram = 1;
-  config.bounce_buffer_size_px = this->width_ * MIPI_RGB_BOUNCE_BUFFER_LINES;
+  config.bounce_buffer_size_px = this->width_ * this->bounce_buffer_lines_;
   config.num_fbs = MIPI_RGB_FRAMEBUFFER_COUNT;
   config.timings.h_res = this->width_;
   config.timings.v_res = this->height_;
@@ -230,9 +227,11 @@ void MipiRgb::common_setup_() {
     this->mark_failed(LOG_STR("lcd setup failed"));
   }
   ESP_LOGCONFIG(TAG, "MipiRgb setup complete");
+  ESP_LOGCONFIG(TAG, "RGB scanout: %s",
+                this->bounce_buffer_lines_ == 0 ? "direct PSRAM EDMA" : "DRAM bounce buffers");
   ESP_LOGCONFIG(TAG, "RGB bounce buffer: %u lines (%u pixels per buffer)",
-                static_cast<unsigned>(MIPI_RGB_BOUNCE_BUFFER_LINES),
-                static_cast<unsigned>(this->width_ * MIPI_RGB_BOUNCE_BUFFER_LINES));
+                static_cast<unsigned>(this->bounce_buffer_lines_),
+                static_cast<unsigned>(this->width_ * this->bounce_buffer_lines_));
   ESP_LOGCONFIG(TAG, "Direct RGB framebuffers: %u (%u bytes each in PSRAM)",
                 static_cast<unsigned>(MIPI_RGB_FRAMEBUFFER_COUNT),
                 static_cast<unsigned>(this->width_ * this->height_ * sizeof(uint16_t)));
@@ -252,6 +251,19 @@ size_t MipiRgb::get_framebuffer_stride() {
 
 uint16_t MipiRgb::native_color(const Color &color) {
   return convert_big_endian(display::ColorUtil::color_to_565(color));
+}
+
+bool MipiRgb::set_runtime_pclk_frequency(uint32_t pclk_frequency) {
+  if (this->handle_ == nullptr)
+    return false;
+  const esp_err_t err = esp_lcd_rgb_panel_set_pclk(this->handle_, pclk_frequency);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to set runtime PCLK to %u Hz: %s",
+             static_cast<unsigned>(pclk_frequency), esp_err_to_name(err));
+    return false;
+  }
+  this->pclk_frequency_ = pclk_frequency;
+  return true;
 }
 
 bool IRAM_ATTR MipiRgb::frame_done_callback_(esp_lcd_panel_handle_t panel,

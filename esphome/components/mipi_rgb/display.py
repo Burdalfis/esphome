@@ -87,6 +87,8 @@ ColorOrder = display.display_ns.enum("ColorMode")
 
 DATA_PIN_SCHEMA = pins.internal_gpio_output_pin_schema
 
+CONF_BOUNCE_BUFFER_LINES = "bounce_buffer_lines"
+
 RgbDriverChip("CUSTOM")
 
 # Import all models dynamically from the models package
@@ -164,6 +166,7 @@ def model_schema(config):
                 cv.frequency, cv.Range(min=4e6, max=100e6)
             ),
             model.option(CONF_PCLK_INVERTED, True): cv.boolean,
+            cv.Optional(CONF_BOUNCE_BUFFER_LINES): cv.int_range(min=0, max=120),
             iseqconf: cv.ensure_list(map_sequence),
             model.option(CONF_BYTE_ORDER, BYTE_ORDER_BIG): cv.one_of(
                 BYTE_ORDER_LITTLE, BYTE_ORDER_BIG, lower=True
@@ -292,6 +295,8 @@ async def to_code(config):
     cg.add(var.set_vsync_front_porch(config[CONF_VSYNC_FRONT_PORCH]))
     cg.add(var.set_pclk_inverted(config[CONF_PCLK_INVERTED]))
     cg.add(var.set_pclk_frequency(config[CONF_PCLK_FREQUENCY]))
+    if CONF_BOUNCE_BUFFER_LINES in config:
+        cg.add(var.set_bounce_buffer_lines(config[CONF_BOUNCE_BUFFER_LINES]))
     dpins = []
     if CONF_RED in config[CONF_DATA_PINS]:
         red_pins = config[CONF_DATA_PINS][CONF_RED]

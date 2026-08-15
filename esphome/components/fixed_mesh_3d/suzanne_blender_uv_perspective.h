@@ -77,6 +77,20 @@ static inline const SuzannePerfStats &get_suzanne_perf_stats() {
   return SUZANNE_PERF_LAST_STATS;
 }
 
+struct SuzanneFrameTiming {
+  uint32_t render_us{0};
+  uint32_t present_us{0};
+  uint32_t work_us{0};
+  uint32_t visible_triangles{0};
+  uint32_t rasterized_triangles{0};
+  uint32_t perspective_blocks{0};
+};
+
+static SuzanneFrameTiming SUZANNE_FRAME_LAST_TIMING{};
+static inline const SuzanneFrameTiming &get_suzanne_frame_timing() {
+  return SUZANNE_FRAME_LAST_TIMING;
+}
+
 struct SuzannePerfAccumulator {
   uint32_t window_start_us{0};
   uint32_t frames{0};
@@ -208,7 +222,8 @@ static inline void draw_suzanne_perf_hud_(DisplayT *display, const SuzannePerfSt
 // handling now live in FixedMeshRenderer.
 template<typename DisplayT>
 PerspectiveStats render_suzanne_blender_uv_perspective(DisplayT *display, uint8_t phase_x, uint8_t phase_y,
-                                                        int32_t camera_z = 500) {
+                                                        int32_t camera_z = 500, bool draw_hud = true,
+                                                        bool log_perf = true) {
   static FixedMeshRenderer<DisplayT, GOURAUD_TOTAL_VERTS> renderer;
   static SuzannePerfAccumulator perf{};
 
@@ -230,7 +245,8 @@ PerspectiveStats render_suzanne_blender_uv_perspective(DisplayT *display, uint8_
 
   const uint32_t render_end_us = micros();
 #if defined(USE_ESP32_VARIANT_ESP32S3)
-  draw_suzanne_perf_hud_(display, SUZANNE_PERF_LAST_STATS);
+  if (draw_hud)
+    draw_suzanne_perf_hud_(display, SUZANNE_PERF_LAST_STATS);
 #endif
   const uint32_t present_start_us = micros();
   const FixedMeshStats mesh_stats = renderer.end_frame();
@@ -249,6 +265,12 @@ PerspectiveStats render_suzanne_blender_uv_perspective(DisplayT *display, uint8_
   const uint32_t render_us = render_end_us - frame_start_us;
   const uint32_t present_us = frame_end_us - present_start_us;
   const uint32_t work_us = frame_end_us - frame_start_us;
+  SUZANNE_FRAME_LAST_TIMING.render_us = render_us;
+  SUZANNE_FRAME_LAST_TIMING.present_us = present_us;
+  SUZANNE_FRAME_LAST_TIMING.work_us = work_us;
+  SUZANNE_FRAME_LAST_TIMING.visible_triangles = mesh_stats.visible_triangles;
+  SUZANNE_FRAME_LAST_TIMING.rasterized_triangles = mesh_stats.rasterized_triangles;
+  SUZANNE_FRAME_LAST_TIMING.perspective_blocks = mesh_stats.perspective_blocks;
   perf.frames++;
   perf.render_sum_us += render_us;
   perf.present_sum_us += present_us;
@@ -272,7 +294,8 @@ PerspectiveStats render_suzanne_blender_uv_perspective(DisplayT *display, uint8_
     SUZANNE_PERF_LAST_STATS.rasterized_triangles = mesh_stats.rasterized_triangles;
     SUZANNE_PERF_LAST_STATS.perspective_blocks = mesh_stats.perspective_blocks;
 
-    ESP_LOGI(SUZANNE_PERF_TAG,
+    if (log_perf)
+      ESP_LOGI(SUZANNE_PERF_TAG,
              "FPS %" PRIu32 ".%" PRIu32 " | period %" PRIu32 ".%" PRIu32
              " ms | render %" PRIu32 ".%" PRIu32 " ms max %" PRIu32 ".%" PRIu32
              " | present %" PRIu32 ".%" PRIu32 " ms max %" PRIu32 ".%" PRIu32
@@ -300,6 +323,140 @@ PerspectiveStats render_suzanne_blender_uv_perspective(DisplayT *display, uint8_
   }
 
   return stats;
+}
+
+
+#if defined(USE_ESP32_VARIANT_ESP32S3)
+struct SuzannePclkBenchmarkState {
+  bool initialized{false};
+  bool finished{false};
+  size_t step{0};
+  uint8_t settle_frames{0};
+  uint32_t original_pclk_hz{0};
+  uint32_t sample_start_us{0};
+  uint32_t frames{0};
+  uint64_t render_sum_us{0};
+  uint64_t present_sum_us{0};
+  uint64_t work_sum_us{0};
+  uint32_t render_max_us{0};
+  uint32_t present_max_us{0};
+  uint32_t work_max_us{0};
+};
+
+static inline void reset_suzanne_pclk_sample_(SuzannePclkBenchmarkState &bench) {
+  bench.sample_start_us = 0;
+  bench.frames = 0;
+  bench.render_sum_us = 0;
+  bench.present_sum_us = 0;
+  bench.work_sum_us = 0;
+  bench.render_max_us = 0;
+  bench.present_max_us = 0;
+  bench.work_max_us = 0;
+}
+#endif
+
+template<typename DisplayT>
+void benchmark_suzanne_pclk(DisplayT *display, int32_t camera_z = 500) {
+#if defined(USE_ESP32_VARIANT_ESP32S3)
+  static constexpr uint32_t PCLK_HZ[] = {
+      12000000u, 14000000u, 16000000u, 18000000u,
+      20000000u, 22000000u, 24000000u, 26000000u,
+  };
+  static constexpr uint8_t BENCH_PHASE_X = 80;
+  static constexpr uint8_t BENCH_PHASE_Y = 160;
+  static constexpr uint8_t SETTLE_FRAMES = 6;
+  static constexpr uint32_t SAMPLE_TIME_US = 2000000u;
+  static SuzannePclkBenchmarkState bench{};
+
+  if (!bench.initialized) {
+    bench.initialized = true;
+    bench.original_pclk_hz = display->get_pclk_frequency();
+    bench.step = 0;
+    bench.settle_frames = SETTLE_FRAMES;
+    reset_suzanne_pclk_sample_(bench);
+    ESP_LOGI(SUZANNE_PERF_TAG,
+             "PCLK_BENCH start | bounce %u lines | fixed phase %u/%u | original %u MHz",
+             static_cast<unsigned>(display->get_bounce_buffer_lines()),
+             static_cast<unsigned>(BENCH_PHASE_X), static_cast<unsigned>(BENCH_PHASE_Y),
+             static_cast<unsigned>(bench.original_pclk_hz / 1000000u));
+    if (!display->set_runtime_pclk_frequency(PCLK_HZ[bench.step])) {
+      ESP_LOGE(SUZANNE_PERF_TAG, "PCLK_BENCH unable to set first PCLK");
+      bench.finished = true;
+    } else {
+      ESP_LOGI(SUZANNE_PERF_TAG, "PCLK_BENCH settling at %u MHz",
+               static_cast<unsigned>(PCLK_HZ[bench.step] / 1000000u));
+    }
+  }
+
+  render_suzanne_blender_uv_perspective(display, BENCH_PHASE_X, BENCH_PHASE_Y,
+                                         camera_z, false, false);
+  if (bench.finished)
+    return;
+
+  const SuzanneFrameTiming frame = get_suzanne_frame_timing();
+  if (bench.settle_frames != 0) {
+    bench.settle_frames--;
+    if (bench.settle_frames == 0)
+      bench.sample_start_us = micros();
+    return;
+  }
+
+  bench.frames++;
+  bench.render_sum_us += frame.render_us;
+  bench.present_sum_us += frame.present_us;
+  bench.work_sum_us += frame.work_us;
+  bench.render_max_us = std::max(bench.render_max_us, frame.render_us);
+  bench.present_max_us = std::max(bench.present_max_us, frame.present_us);
+  bench.work_max_us = std::max(bench.work_max_us, frame.work_us);
+
+  const uint32_t now_us = micros();
+  if (bench.sample_start_us == 0)
+    bench.sample_start_us = now_us;
+  const uint32_t elapsed_us = now_us - bench.sample_start_us;
+  if (elapsed_us < SAMPLE_TIME_US || bench.frames == 0)
+    return;
+
+  const uint32_t avg_render = static_cast<uint32_t>(bench.render_sum_us / bench.frames);
+  const uint32_t avg_present = static_cast<uint32_t>(bench.present_sum_us / bench.frames);
+  const uint32_t avg_work = static_cast<uint32_t>(bench.work_sum_us / bench.frames);
+  const uint32_t pclk_mhz = PCLK_HZ[bench.step] / 1000000u;
+  ESP_LOGI(SUZANNE_PERF_TAG,
+           "PCLK_BENCH %u MHz | bounce %u | frames %u | render %u.%u ms max %u.%u | "
+           "present %u.%u ms max %u.%u | work %u.%u ms max %u.%u | tris %u | blocks %u",
+           static_cast<unsigned>(pclk_mhz), static_cast<unsigned>(display->get_bounce_buffer_lines()),
+           static_cast<unsigned>(bench.frames),
+           static_cast<unsigned>(avg_render / 1000), static_cast<unsigned>((avg_render / 100) % 10),
+           static_cast<unsigned>(bench.render_max_us / 1000), static_cast<unsigned>((bench.render_max_us / 100) % 10),
+           static_cast<unsigned>(avg_present / 1000), static_cast<unsigned>((avg_present / 100) % 10),
+           static_cast<unsigned>(bench.present_max_us / 1000), static_cast<unsigned>((bench.present_max_us / 100) % 10),
+           static_cast<unsigned>(avg_work / 1000), static_cast<unsigned>((avg_work / 100) % 10),
+           static_cast<unsigned>(bench.work_max_us / 1000), static_cast<unsigned>((bench.work_max_us / 100) % 10),
+           static_cast<unsigned>(frame.visible_triangles), static_cast<unsigned>(frame.perspective_blocks));
+
+  bench.step++;
+  reset_suzanne_pclk_sample_(bench);
+  if (bench.step >= (sizeof(PCLK_HZ) / sizeof(PCLK_HZ[0]))) {
+    display->set_runtime_pclk_frequency(bench.original_pclk_hz);
+    bench.finished = true;
+    ESP_LOGI(SUZANNE_PERF_TAG, "PCLK_BENCH complete | restored %u MHz",
+             static_cast<unsigned>(bench.original_pclk_hz / 1000000u));
+    return;
+  }
+
+  bench.settle_frames = SETTLE_FRAMES;
+  if (!display->set_runtime_pclk_frequency(PCLK_HZ[bench.step])) {
+    ESP_LOGE(SUZANNE_PERF_TAG, "PCLK_BENCH failed setting %u MHz",
+             static_cast<unsigned>(PCLK_HZ[bench.step] / 1000000u));
+    display->set_runtime_pclk_frequency(bench.original_pclk_hz);
+    bench.finished = true;
+    return;
+  }
+  ESP_LOGI(SUZANNE_PERF_TAG, "PCLK_BENCH settling at %u MHz",
+           static_cast<unsigned>(PCLK_HZ[bench.step] / 1000000u));
+#else
+  (void) camera_z;
+  (void) display;
+#endif
 }
 
 }  // namespace esphome::mipi_spi::demo3d
