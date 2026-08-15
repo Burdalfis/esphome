@@ -282,6 +282,21 @@ bool MipiRgb::recover_scanout() {
   // our A/B/C software ownership to match the hardware again.
   while (xSemaphoreTake(this->frame_done_sem_, 0) == pdTRUE) {
   }
+
+  // draw_bitmap() with an IDF-owned framebuffer updates cur_fb_index and, in
+  // direct stream mode, reconnects every framebuffer DMA tail to that selected
+  // link. Do this before the S3 restart so the special FB0 restart link cannot
+  // fall through into whichever framebuffer happened to be current before the
+  // recovery request. It also performs the required cache writeback for FB0.
+  const esp_err_t select_err = esp_lcd_panel_draw_bitmap(
+      this->handle_, 0, 0, this->width_, this->height_, this->panel_framebuffers_[0]);
+  if (select_err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to select FB0 for RGB scanout recovery: %s", esp_err_to_name(select_err));
+    return false;
+  }
+  while (xSemaphoreTake(this->frame_done_sem_, 0) == pdTRUE) {
+  }
+
   const uint32_t start_vsync = this->vsync_count_;
   const esp_err_t err = esp_lcd_rgb_panel_restart(this->handle_);
   if (err != ESP_OK) {
