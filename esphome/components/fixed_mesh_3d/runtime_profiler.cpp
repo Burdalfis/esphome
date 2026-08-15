@@ -61,6 +61,11 @@ void RuntimeProfilerComponent::sample_() {
         for (size_t j = 0; j < this->previous_task_count_; j++) {
           if (this->previous_tasks_[j].handle != current.xHandle)
             continue;
+          // Task handles can be recycled. Treat a counter that moved backwards
+          // as a new task instead of turning the unsigned subtraction into an
+          // enormous bogus CPU spike.
+          if (current.ulRunTimeCounter < this->previous_tasks_[j].runtime)
+            break;
           const configRUN_TIME_COUNTER_TYPE delta = current.ulRunTimeCounter - this->previous_tasks_[j].runtime;
           if (delta != 0) {
             auto &entry = this->task_deltas_[delta_count++];
@@ -89,8 +94,8 @@ void RuntimeProfilerComponent::sample_() {
         if (cpu_x10 == 0)
           continue;
         const int affinity = entry.affinity == tskNO_AFFINITY ? -1 : static_cast<int>(entry.affinity);
-        // ESP_TIMER is the default runtime-stat source and is explicitly selected by
-        // this component, so the counter unit is one microsecond.
+        // ESP_TIMER is explicitly selected as the runtime-stat source, so the
+        // scheduler counter unit is one microsecond.
         const uint64_t runtime_ms = static_cast<uint64_t>(entry.runtime) / 1000ULL;
         ESP_LOGI(TAG, "  %-16s core %d | %" PRIu32 ".%" PRIu32 "%% core | +%" PRIu64 " ms",
                  entry.name != nullptr ? entry.name : "?", affinity,
