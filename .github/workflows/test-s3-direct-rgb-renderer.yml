@@ -27,6 +27,15 @@ jobs:
             includes:
               - <esphome/components/mipi_spi/suzanne_blender_uv_perspective.h>
 
+          external_components:
+            - source:
+                type: git
+                url: https://github.com/Burdalfis/esphome
+                ref: agent/c6-async-mipi-dma
+              components:
+                - mipi_spi
+              refresh: 0s
+
           esp32:
             board: esp32-s3-devkitc-1
             variant: esp32s3
