@@ -1,0 +1,30 @@
+from pathlib import Path
+
+h = Path('esphome/components/mipi_rgb/mipi_rgb.h')
+s = h.read_text()
+s = s.replace(
+'''  bool set_runtime_pclk_frequency(uint32_t pclk_frequency);\n  uint32_t get_pclk_frequency() const { return this->pclk_frequency_; }\n''',
+'''  bool set_runtime_pclk_frequency(uint32_t pclk_frequency);\n  bool recover_scanout();\n  uint32_t get_pclk_frequency() const { return this->pclk_frequency_; }\n''')
+h.write_text(s)
+
+p = Path('esphome/components/mipi_rgb/mipi_rgb.cpp')
+s = p.read_text()
+needle = '''bool MipiRgb::set_runtime_pclk_frequency(uint32_t pclk_frequency) {\n  if (this->handle_ == nullptr)\n    return false;\n  const esp_err_t err = esp_lcd_rgb_panel_set_pclk(this->handle_, pclk_frequency);\n  if (err != ESP_OK) {\n    ESP_LOGE(TAG, "Failed to set runtime PCLK to %u Hz: %s",\n             static_cast<unsigned>(pclk_frequency), esp_err_to_name(err));\n    return false;\n  }\n  this->pclk_frequency_ = pclk_frequency;\n  return true;\n}\n'''
+replacement = needle + '''\nbool MipiRgb::recover_scanout() {\n#if defined(USE_ESP32_VARIANT_ESP32S3)\n  if (this->handle_ == nullptr || this->frame_done_sem_ == nullptr)\n    return false;\n  if (this->bounce_buffer_lines_ != 0)\n    return true;\n\n  // ESP32-S3's direct-EDMA restart link is built from framebuffer 0. Use that\n  // deliberately as a known synchronization point after a bandwidth-induced\n  // scanout desync. Wait until the restart has crossed VSYNC before resetting\n  // our A/B/C software ownership to match the hardware again.\n  while (xSemaphoreTake(this->frame_done_sem_, 0) == pdTRUE) {\n  }\n  const uint32_t start_vsync = this->vsync_count_;\n  const esp_err_t err = esp_lcd_rgb_panel_restart(this->handle_);\n  if (err != ESP_OK) {\n    ESP_LOGE(TAG, "Failed to request RGB scanout recovery: %s", esp_err_to_name(err));\n    return false;\n  }\n\n  while (static_cast<uint32_t>(this->vsync_count_ - start_vsync) < 2u) {\n    if (xSemaphoreTake(this->frame_done_sem_, pdMS_TO_TICKS(250)) != pdTRUE) {\n      ESP_LOGE(TAG, "Timed out waiting for RGB scanout recovery");\n      return false;\n    }\n  }\n\n  this->scanout_framebuffer_index_ = 0;\n  this->render_framebuffer_index_ = 1;\n  this->free_framebuffer_index_ = 2;\n  this->pending_framebuffer_index_ = MIPI_RGB_NO_FRAMEBUFFER;\n  this->pending_frame_done_count_ = this->frame_done_count_;\n  this->pending_vsync_count_ = this->vsync_count_;\n  this->direct_present_failed_ = false;\n  while (xSemaphoreTake(this->frame_done_sem_, 0) == pdTRUE) {\n  }\n  ESP_LOGI(TAG, "Direct RGB scanout recovered via FB0 restart");\n  return true;\n#else\n  return false;\n#endif\n}\n'''
+if needle not in s:
+    raise SystemExit('set_runtime_pclk_frequency needle not found')
+s = s.replace(needle, replacement)
+p.write_text(s)
+
+b = Path('esphome/components/fixed_mesh_3d/suzanne_blender_uv_perspective.h')
+s = b.read_text()
+s = s.replace(
+'''    if (!display->set_runtime_pclk_frequency(PCLK_HZ[bench.step])) {\n      ESP_LOGE(SUZANNE_PERF_TAG, "PCLK_BENCH unable to set first PCLK");\n      bench.finished = true;\n    } else {\n      ESP_LOGI(SUZANNE_PERF_TAG, "PCLK_BENCH settling at %u MHz",\n               static_cast<unsigned>(PCLK_HZ[bench.step] / 1000000u));\n    }\n''',
+'''    if (!display->set_runtime_pclk_frequency(PCLK_HZ[bench.step])) {\n      ESP_LOGE(SUZANNE_PERF_TAG, "PCLK_BENCH unable to set first PCLK");\n      bench.finished = true;\n    } else if (display->get_bounce_buffer_lines() == 0 && !display->recover_scanout()) {\n      ESP_LOGE(SUZANNE_PERF_TAG, "PCLK_BENCH unable to recover direct scanout at first PCLK");\n      bench.finished = true;\n    } else {\n      ESP_LOGI(SUZANNE_PERF_TAG, "PCLK_BENCH settling at %u MHz",\n               static_cast<unsigned>(PCLK_HZ[bench.step] / 1000000u));\n    }\n''')
+s = s.replace(
+'''  if (bench.step >= (sizeof(PCLK_HZ) / sizeof(PCLK_HZ[0]))) {\n    display->set_runtime_pclk_frequency(bench.original_pclk_hz);\n    bench.finished = true;\n    ESP_LOGI(SUZANNE_PERF_TAG, "PCLK_BENCH complete | restored %u MHz",\n             static_cast<unsigned>(bench.original_pclk_hz / 1000000u));\n    return;\n  }\n''',
+'''  if (bench.step >= (sizeof(PCLK_HZ) / sizeof(PCLK_HZ[0]))) {\n    display->set_runtime_pclk_frequency(bench.original_pclk_hz);\n    if (display->get_bounce_buffer_lines() == 0 && !display->recover_scanout())\n      ESP_LOGE(SUZANNE_PERF_TAG, "PCLK_BENCH failed recovering direct scanout after restore");\n    bench.finished = true;\n    ESP_LOGI(SUZANNE_PERF_TAG, "PCLK_BENCH complete | restored %u MHz and recovered scanout",\n             static_cast<unsigned>(bench.original_pclk_hz / 1000000u));\n    return;\n  }\n''')
+s = s.replace(
+'''  if (!display->set_runtime_pclk_frequency(PCLK_HZ[bench.step])) {\n    ESP_LOGE(SUZANNE_PERF_TAG, "PCLK_BENCH failed setting %u MHz",\n             static_cast<unsigned>(PCLK_HZ[bench.step] / 1000000u));\n    display->set_runtime_pclk_frequency(bench.original_pclk_hz);\n    bench.finished = true;\n    return;\n  }\n  ESP_LOGI(SUZANNE_PERF_TAG, "PCLK_BENCH settling at %u MHz",\n           static_cast<unsigned>(PCLK_HZ[bench.step] / 1000000u));\n''',
+'''  if (!display->set_runtime_pclk_frequency(PCLK_HZ[bench.step])) {\n    ESP_LOGE(SUZANNE_PERF_TAG, "PCLK_BENCH failed setting %u MHz",\n             static_cast<unsigned>(PCLK_HZ[bench.step] / 1000000u));\n    display->set_runtime_pclk_frequency(bench.original_pclk_hz);\n    if (display->get_bounce_buffer_lines() == 0)\n      display->recover_scanout();\n    bench.finished = true;\n    return;\n  }\n  if (display->get_bounce_buffer_lines() == 0 && !display->recover_scanout()) {\n    ESP_LOGE(SUZANNE_PERF_TAG, "PCLK_BENCH failed recovering direct scanout at %u MHz",\n             static_cast<unsigned>(PCLK_HZ[bench.step] / 1000000u));\n    display->set_runtime_pclk_frequency(bench.original_pclk_hz);\n    display->recover_scanout();\n    bench.finished = true;\n    return;\n  }\n  ESP_LOGI(SUZANNE_PERF_TAG, "PCLK_BENCH settling at %u MHz",\n           static_cast<unsigned>(PCLK_HZ[bench.step] / 1000000u));\n''')
+b.write_text(s)
