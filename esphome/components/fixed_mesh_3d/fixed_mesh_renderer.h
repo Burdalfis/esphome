@@ -729,6 +729,7 @@ template<typename DisplayT, size_t MAX_VERTICES> class FixedMeshRenderer {
   }
 
   bool select_buffer_state_(PixelT *framebuffer) {
+    this->buffer_state_ = nullptr;
     BufferState *empty = nullptr;
     for (auto &state : this->buffer_states_) {
       if (state.framebuffer == framebuffer) {
