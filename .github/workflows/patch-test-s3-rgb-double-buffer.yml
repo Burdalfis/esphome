@@ -1,0 +1,101 @@
+name: Patch and test S3 RGB double buffer
+
+on:
+  push:
+    branches:
+      - agent/c6-async-mipi-dma
+    paths:
+      - .github/scripts/patch_s3_rgb_double_buffer.py
+      - .github/workflows/patch-test-s3-rgb-double-buffer.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/c6-async-mipi-dma
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply patch
+        run: python .github/scripts/patch_s3_rgb_double_buffer.py
+      - name: Verify patch structure
+        run: |
+          grep -q 'config.num_fbs = MIPI_RGB_FRAMEBUFFER_COUNT' esphome/components/mipi_rgb/mipi_rgb.cpp
+          grep -q 'on_bounce_frame_finish' esphome/components/mipi_rgb/mipi_rgb.cpp
+          grep -q 'render_framebuffer_index_ \^= 1u' esphome/components/mipi_rgb/mipi_rgb.cpp
+          grep -q 'std::array<BufferState, 3>' esphome/components/fixed_mesh_3d/fixed_mesh_renderer.h
+      - name: Commit functional patch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add esphome/components/mipi_rgb/mipi_rgb.h esphome/components/mipi_rgb/mipi_rgb.cpp esphome/components/fixed_mesh_3d/fixed_mesh_renderer.h esphome/components/mipi_spi/fixed_mesh_renderer.h
+          git commit -m 'Add VSYNC-safe RGB double buffering [skip ci]'
+          git push origin HEAD:agent/c6-async-mipi-dma
+      - name: Install ESPHome from patched checkout
+        run: pip install -e .
+      - name: Write S3 renderer test config
+        run: |
+          cat >/tmp/s3-render-test.yaml <<'YAML'
+          esphome:
+            name: s3-render-test
+            includes:
+              - <esphome/components/fixed_mesh_3d/suzanne_blender_uv_perspective.h>
+
+          external_components:
+            - source:
+                type: git
+                url: https://github.com/Burdalfis/esphome
+                ref: agent/c6-async-mipi-dma
+              components:
+                - fixed_mesh_3d
+              refresh: 0s
+
+          fixed_mesh_3d:
+
+          esp32:
+            board: esp32-s3-devkitc-1
+            variant: esp32s3
+            flash_size: 16MB
+            cpu_frequency: 240MHz
+            framework:
+              type: esp-idf
+              advanced:
+                execute_from_psram: true
+
+          psram:
+            mode: octal
+            speed: 80MHz
+
+          logger:
+
+          i2c:
+            sda: GPIO8
+            scl: GPIO9
+            frequency: 400kHz
+            id: display_i2c
+
+          ch422g:
+            - id: ch422g_hub
+              i2c_id: display_i2c
+
+          display:
+            - platform: mipi_rgb
+              model: ESP32-S3-TOUCH-LCD-7-800X480
+              id: lcd_display
+              auto_clear_enabled: false
+              update_interval: 50ms
+              lambda: |-
+                static uint8_t phase_x = 0;
+                static uint8_t phase_y = 0;
+                esphome::mipi_spi::demo3d::render_suzanne_blender_uv_perspective(
+                    id(lcd_display), phase_x, phase_y, 500);
+                phase_x += 1;
+                phase_y += 2;
+          YAML
+      - name: Compile full S3 firmware
+        run: python -m esphome compile /tmp/s3-render-test.yaml
