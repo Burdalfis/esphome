@@ -199,7 +199,7 @@ void MipiRgb::common_setup_() {
         err = ESP_ERR_NO_MEM;
       } else {
         esp_lcd_rgb_panel_event_callbacks_t callbacks{};
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
         callbacks.on_frame_buf_complete = &MipiRgb::frame_done_callback_;
 #elif ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 2)
         callbacks.on_bounce_frame_finish = &MipiRgb::frame_done_callback_;
