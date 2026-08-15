@@ -1,0 +1,64 @@
+name: tmp-s3-triple-profiler
+
+on:
+  push:
+    branches:
+      - agent/c6-async-mipi-dma
+  workflow_dispatch:
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install ESPHome checkout
+        run: pip install -e .
+      - name: Write S3 test config
+        run: |
+          cat >/tmp/s3-triple.yaml <<'EOF'
+          esphome:
+            name: s3-triple-test
+            includes:
+              - <esphome/components/fixed_mesh_3d/suzanne_blender_uv_perspective.h>
+
+          esp32:
+            board: esp32-s3-devkitc-1
+            framework:
+              type: esp-idf
+              advanced:
+                execute_from_psram: true
+
+          logger:
+
+          psram:
+            mode: octal
+            speed: 80MHz
+
+          i2c:
+            sda: GPIO8
+            scl: GPIO9
+
+          ch422g:
+
+          fixed_mesh_3d:
+
+          display:
+            - platform: mipi_rgb
+              model: ESP32-S3-TOUCH-LCD-7-800X480
+              id: lcd_display
+              pclk_frequency: 22MHz
+              auto_clear_enabled: false
+              update_interval: 50ms
+              lambda: |-
+                static uint8_t phase_x = 0;
+                static uint8_t phase_y = 0;
+                esphome::mipi_spi::demo3d::render_suzanne_blender_uv_perspective(
+                  id(lcd_display), phase_x, phase_y, 500);
+                phase_x += 1;
+                phase_y += 2;
+          EOF
+      - name: Compile S3 firmware
+        run: python -m esphome compile /tmp/s3-triple.yaml
