@@ -278,11 +278,13 @@ void MipiRgb::mark_dirty(int x0, int y0, int x1, int y1) {
 
   // If a previously submitted framebuffer is still pending, wait here -- after
   // the CPU has spent an entire frame rendering into the third buffer -- rather
-  // than immediately after submission. With render times longer than one panel
-  // refresh this is normally an immediate semaphore take and removes the old
-  // integer-VSYNC pacing staircase.
+  // than immediately after submission. Two completion boundaries are required
+  // conservatively: draw_bitmap() can race the bounce ISR after it captured the
+  // old cur_fb_index but just before it emits a frame-complete callback. The
+  // second callback guarantees the new source has actually been consumed and
+  // the old scanout framebuffer is safe to recycle.
   if (this->pending_framebuffer_index_ != MIPI_RGB_NO_FRAMEBUFFER) {
-    while (this->frame_done_count_ == this->pending_frame_done_count_) {
+    while (static_cast<uint32_t>(this->frame_done_count_ - this->pending_frame_done_count_) < 2u) {
       if (xSemaphoreTake(this->frame_done_sem_, pdMS_TO_TICKS(250)) != pdTRUE) {
         ESP_LOGE(TAG, "Timed out waiting for RGB framebuffer handoff");
         this->direct_present_failed_ = true;
@@ -316,9 +318,6 @@ void MipiRgb::mark_dirty(int x0, int y0, int x1, int y1) {
   }
 
   this->pending_framebuffer_index_ = completed_index;
-  // Capture after submission. If a frame callback races this assignment we may
-  // conservatively wait for one additional callback, but we can never reuse the
-  // old scanout buffer too early.
   this->pending_frame_done_count_ = this->frame_done_count_;
   this->render_framebuffer_index_ = this->free_framebuffer_index_;
   this->free_framebuffer_index_ = MIPI_RGB_NO_FRAMEBUFFER;
@@ -352,6 +351,7 @@ void MipiRgb::update() {
   int h = this->y_high_ - this->y_low_ + 1;
   this->write_to_display_(this->x_low_, this->y_low_, w, h, reinterpret_cast<const uint8_t *>(this->buffer_),
                           this->x_low_, this->y_low_, this->width_ - w - this->x_low_);
+  // invalidate watermarks
   this->x_low_ = this->width_;
   this->y_low_ = this->height_;
   this->x_high_ = 0;
@@ -362,6 +362,8 @@ void MipiRgb::draw_pixels_at(int x_start, int y_start, int w, int h, const uint8
                              display::ColorBitness bitness, bool big_endian, int x_offset, int y_offset, int x_pad) {
   if (w <= 0 || h <= 0 || this->is_failed())
     return;
+  // if color mapping is required, pass the buck.
+  // note that endianness is not considered here - it is assumed to match!
   if (bitness != display::COLOR_BITNESS_565) {
     Display::draw_pixels_at(x_start, y_start, w, h, ptr, order, bitness, big_endian, x_offset, y_offset, x_pad);
     this->write_to_display_(x_start, y_start, w, h, reinterpret_cast<const uint8_t *>(this->buffer_), x_start, y_start,
