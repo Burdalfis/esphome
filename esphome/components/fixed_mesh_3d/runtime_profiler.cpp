@@ -37,6 +37,10 @@ void RuntimeProfilerComponent::sample_() {
     return;
   }
 
+  const TaskHandle_t idle_handles[2] = {
+      xTaskGetIdleTaskHandleForCore(0),
+      xTaskGetIdleTaskHandleForCore(1),
+  };
   const configRUN_TIME_COUNTER_TYPE idle_runtime[2] = {
       ulTaskGetIdleRunTimeCounterForCore(0),
       ulTaskGetIdleRunTimeCounterForCore(1),
@@ -58,6 +62,8 @@ void RuntimeProfilerComponent::sample_() {
       size_t delta_count = 0;
       for (UBaseType_t i = 0; i < count && delta_count < MAX_TASKS; i++) {
         const auto &current = this->current_tasks_[i];
+        if (current.xHandle == idle_handles[0] || current.xHandle == idle_handles[1])
+          continue;
         for (size_t j = 0; j < this->previous_task_count_; j++) {
           if (this->previous_tasks_[j].handle != current.xHandle)
             continue;
