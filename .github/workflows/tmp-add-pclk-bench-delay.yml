@@ -1,0 +1,89 @@
+name: tmp-add-pclk-bench-delay
+
+on:
+  push:
+    branches:
+      - agent/c6-async-mipi-dma
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-compile:
+    if: github.event.head_commit.message == 'Add temporary PCLK benchmark startup delay workflow'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/c6-async-mipi-dma
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Add startup delay
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('esphome/components/fixed_mesh_3d/suzanne_blender_uv_perspective.h')
+          s = p.read_text()
+          old = '''struct SuzannePclkBenchmarkState {\n  bool initialized{false};\n  bool finished{false};\n  size_t step{0};\n'''
+          new = '''struct SuzannePclkBenchmarkState {\n  bool initialized{false};\n  bool sweep_started{false};\n  bool finished{false};\n  size_t step{0};\n  uint32_t startup_start_us{0};\n'''
+          if s.count(old) != 1:
+              raise SystemExit('benchmark state pattern mismatch')
+          s = s.replace(old, new, 1)
+
+          old = '''  static constexpr uint8_t SETTLE_FRAMES = 6;\n  static constexpr uint32_t SAMPLE_TIME_US = 2000000u;\n  static SuzannePclkBenchmarkState bench{};\n\n  if (!bench.initialized) {\n    bench.initialized = true;\n    bench.original_pclk_hz = display->get_pclk_frequency();\n    bench.step = 0;\n    bench.settle_frames = SETTLE_FRAMES;\n    reset_suzanne_pclk_sample_(bench);\n    ESP_LOGI(SUZANNE_PERF_TAG,\n             \"PCLK_BENCH start | bounce %u lines | fixed phase %u/%u | original %u MHz\",\n             static_cast<unsigned>(display->get_bounce_buffer_lines()),\n             static_cast<unsigned>(BENCH_PHASE_X), static_cast<unsigned>(BENCH_PHASE_Y),\n             static_cast<unsigned>(bench.original_pclk_hz / 1000000u));\n    if (!display->set_runtime_pclk_frequency(PCLK_HZ[bench.step])) {\n      ESP_LOGE(SUZANNE_PERF_TAG, \"PCLK_BENCH unable to set first PCLK\");\n      bench.finished = true;\n    } else {\n      ESP_LOGI(SUZANNE_PERF_TAG, \"PCLK_BENCH settling at %u MHz\",\n               static_cast<unsigned>(PCLK_HZ[bench.step] / 1000000u));\n    }\n  }\n\n'''
+          new = '''  static constexpr uint8_t SETTLE_FRAMES = 6;\n  static constexpr uint32_t SAMPLE_TIME_US = 2000000u;\n  static constexpr uint32_t STARTUP_DELAY_US = 8000000u;\n  static SuzannePclkBenchmarkState bench{};\n\n  if (!bench.initialized) {\n    bench.initialized = true;\n    bench.original_pclk_hz = display->get_pclk_frequency();\n    bench.startup_start_us = micros();\n    ESP_LOGI(SUZANNE_PERF_TAG, \"PCLK_BENCH waiting 8 s for logger connection\");\n    return;\n  }\n\n  if (!bench.sweep_started) {\n    if (static_cast<uint32_t>(micros() - bench.startup_start_us) < STARTUP_DELAY_US)\n      return;\n    bench.sweep_started = true;\n    bench.step = 0;\n    bench.settle_frames = SETTLE_FRAMES;\n    reset_suzanne_pclk_sample_(bench);\n    ESP_LOGI(SUZANNE_PERF_TAG,\n             \"PCLK_BENCH start | bounce %u lines | fixed phase %u/%u | original %u MHz\",\n             static_cast<unsigned>(display->get_bounce_buffer_lines()),\n             static_cast<unsigned>(BENCH_PHASE_X), static_cast<unsigned>(BENCH_PHASE_Y),\n             static_cast<unsigned>(bench.original_pclk_hz / 1000000u));\n    if (!display->set_runtime_pclk_frequency(PCLK_HZ[bench.step])) {\n      ESP_LOGE(SUZANNE_PERF_TAG, \"PCLK_BENCH unable to set first PCLK\");\n      bench.finished = true;\n    } else {\n      ESP_LOGI(SUZANNE_PERF_TAG, \"PCLK_BENCH settling at %u MHz\",\n               static_cast<unsigned>(PCLK_HZ[bench.step] / 1000000u));\n    }\n  }\n\n'''
+          if s.count(old) != 1:
+              raise SystemExit('benchmark startup pattern mismatch')
+          p.write_text(s.replace(old, new, 1))
+          PY
+      - name: Install ESPHome checkout
+        run: pip install -e .
+      - name: Write benchmark config
+        run: |
+          cat > /tmp/bench.yaml <<'YAML'
+          esphome:
+            name: s3-pclk-ci
+            includes:
+              - <esphome/components/fixed_mesh_3d/suzanne_blender_uv_perspective.h>
+          esp32:
+            board: esp32-s3-devkitc-1
+            variant: esp32s3
+            flash_size: 16MB
+            framework:
+              type: esp-idf
+              advanced:
+                execute_from_psram: true
+          psram:
+            mode: octal
+            speed: 80MHz
+          logger:
+          fixed_mesh_3d:
+          i2c:
+            sda: 8
+            scl: 9
+          ch422g:
+          display:
+            - platform: mipi_rgb
+              model: ESP32-S3-TOUCH-LCD-7-800X480
+              id: lcd_display
+              pclk_frequency: 16MHz
+              bounce_buffer_lines: 20
+              auto_clear_enabled: false
+              update_interval: 10ms
+              lambda: |-
+                esphome::mipi_spi::demo3d::benchmark_suzanne_pclk(id(lcd_display), 500);
+          YAML
+      - name: Compile bounce mode
+        run: esphome compile /tmp/bench.yaml
+      - name: Compile direct EDMA mode
+        run: |
+          sed -i 's/bounce_buffer_lines: 20/bounce_buffer_lines: 0/' /tmp/bench.yaml
+          esphome compile /tmp/bench.yaml
+      - name: Commit source changes
+        run: |
+          git config user.name Burdalfis
+          git config user.email xelastlaurent@gmail.com
+          git add esphome/components/fixed_mesh_3d/suzanne_blender_uv_perspective.h
+          git commit -m 'Delay S3 PCLK benchmark startup'
+          git push origin HEAD:agent/c6-async-mipi-dma
