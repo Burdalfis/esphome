@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 
@@ -187,15 +188,17 @@ static inline void draw_suzanne_perf_hud_(DisplayT *display, const SuzannePerfSt
   suzanne_hud_fill_rect_(fb, stride, screen_w, screen_h, x, y, hud_w, hud_h, bg);
 
   char line[24];
-  std::snprintf(line, sizeof(line), "FPS %u.%u", perf.fps_x10 / 10, perf.fps_x10 % 10);
+  std::snprintf(line, sizeof(line), "FPS %" PRIu32 ".%" PRIu32, perf.fps_x10 / 10, perf.fps_x10 % 10);
   suzanne_hud_text_(fb, stride, screen_w, screen_h, x + 4, y + 4, line, fg);
-  std::snprintf(line, sizeof(line), "REN %u.%uMS", perf.render_us / 1000, (perf.render_us / 100) % 10);
+  std::snprintf(line, sizeof(line), "REN %" PRIu32 ".%" PRIu32 "MS", perf.render_us / 1000,
+                (perf.render_us / 100) % 10);
   suzanne_hud_text_(fb, stride, screen_w, screen_h, x + 4, y + 20, line, fg);
-  std::snprintf(line, sizeof(line), "PRS %u.%uMS", perf.present_us / 1000, (perf.present_us / 100) % 10);
+  std::snprintf(line, sizeof(line), "PRS %" PRIu32 ".%" PRIu32 "MS", perf.present_us / 1000,
+                (perf.present_us / 100) % 10);
   suzanne_hud_text_(fb, stride, screen_w, screen_h, x + 4, y + 36, line, fg);
-  std::snprintf(line, sizeof(line), "TRI %u", perf.visible_triangles);
+  std::snprintf(line, sizeof(line), "TRI %" PRIu32, perf.visible_triangles);
   suzanne_hud_text_(fb, stride, screen_w, screen_h, x + 4, y + 52, line, fg);
-  std::snprintf(line, sizeof(line), "BLK %u", perf.perspective_blocks);
+  std::snprintf(line, sizeof(line), "BLK %" PRIu32, perf.perspective_blocks);
   suzanne_hud_text_(fb, stride, screen_w, screen_h, x + 4, y + 68, line, fg);
 }
 #endif  // USE_ESP32_VARIANT_ESP32S3
@@ -270,8 +273,11 @@ PerspectiveStats render_suzanne_blender_uv_perspective(DisplayT *display, uint8_
     SUZANNE_PERF_LAST_STATS.perspective_blocks = mesh_stats.perspective_blocks;
 
     ESP_LOGI(SUZANNE_PERF_TAG,
-             "FPS %u.%u | period %u.%u ms | render %u.%u ms max %u.%u | present %u.%u ms max %u.%u | "
-             "work %u.%u ms max %u.%u | tris %u vis / %u rast | persp blocks %u",
+             "FPS %" PRIu32 ".%" PRIu32 " | period %" PRIu32 ".%" PRIu32
+             " ms | render %" PRIu32 ".%" PRIu32 " ms max %" PRIu32 ".%" PRIu32
+             " | present %" PRIu32 ".%" PRIu32 " ms max %" PRIu32 ".%" PRIu32
+             " | work %" PRIu32 ".%" PRIu32 " ms max %" PRIu32 ".%" PRIu32
+             " | tris %" PRIu32 " vis / %" PRIu32 " rast | persp blocks %" PRIu32,
              SUZANNE_PERF_LAST_STATS.fps_x10 / 10, SUZANNE_PERF_LAST_STATS.fps_x10 % 10,
              SUZANNE_PERF_LAST_STATS.period_us / 1000, (SUZANNE_PERF_LAST_STATS.period_us / 100) % 10,
              SUZANNE_PERF_LAST_STATS.render_us / 1000, (SUZANNE_PERF_LAST_STATS.render_us / 100) % 10,
