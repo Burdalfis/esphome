@@ -1,6 +1,10 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components.esp32 import add_idf_sdkconfig_option
+from esphome.components.esp32 import (
+    VARIANT_ESP32S3,
+    add_idf_sdkconfig_option,
+    get_esp32_variant,
+)
 from esphome.const import CONF_ID
 from esphome.core import CORE
 
@@ -18,10 +22,10 @@ CONFIG_SCHEMA = cv.Schema(
 
 
 async def to_code(config):
-    # Fixed-mesh experiments use FreeRTOS task/core runtime deltas to decide
-    # where renderer workers should live. Match Espressif's real_time_stats
-    # example and use ESP_TIMER + 64-bit counters for stable time-based data.
-    if CORE.using_esp_idf:
+    # On the dual-core S3, collect FreeRTOS task/core runtime deltas so renderer
+    # worker placement can be based on measured CPU occupancy. Match Espressif's
+    # real_time_stats example and use ESP_TIMER + 64-bit counters.
+    if CORE.using_esp_idf and get_esp32_variant() == VARIANT_ESP32S3:
         add_idf_sdkconfig_option("CONFIG_FREERTOS_USE_TRACE_FACILITY", True)
         add_idf_sdkconfig_option("CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS", True)
         add_idf_sdkconfig_option("CONFIG_FREERTOS_RUN_TIME_COUNTER_TYPE_U64", True)
