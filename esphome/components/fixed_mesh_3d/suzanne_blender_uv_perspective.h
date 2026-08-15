@@ -329,8 +329,10 @@ PerspectiveStats render_suzanne_blender_uv_perspective(DisplayT *display, uint8_
 #if defined(USE_ESP32_VARIANT_ESP32S3)
 struct SuzannePclkBenchmarkState {
   bool initialized{false};
+  bool sweep_started{false};
   bool finished{false};
   size_t step{0};
+  uint32_t startup_start_us{0};
   uint8_t settle_frames{0};
   uint32_t original_pclk_hz{0};
   uint32_t sample_start_us{0};
@@ -366,11 +368,21 @@ void benchmark_suzanne_pclk(DisplayT *display, int32_t camera_z = 500) {
   static constexpr uint8_t BENCH_PHASE_Y = 160;
   static constexpr uint8_t SETTLE_FRAMES = 6;
   static constexpr uint32_t SAMPLE_TIME_US = 2000000u;
+  static constexpr uint32_t STARTUP_DELAY_US = 8000000u;
   static SuzannePclkBenchmarkState bench{};
 
   if (!bench.initialized) {
     bench.initialized = true;
     bench.original_pclk_hz = display->get_pclk_frequency();
+    bench.startup_start_us = micros();
+    ESP_LOGI(SUZANNE_PERF_TAG, "PCLK_BENCH waiting 8 s for logger connection");
+    return;
+  }
+
+  if (!bench.sweep_started) {
+    if (static_cast<uint32_t>(micros() - bench.startup_start_us) < STARTUP_DELAY_US)
+      return;
+    bench.sweep_started = true;
     bench.step = 0;
     bench.settle_frames = SETTLE_FRAMES;
     reset_suzanne_pclk_sample_(bench);
