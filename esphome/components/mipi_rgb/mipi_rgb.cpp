@@ -296,7 +296,12 @@ void MipiRgb::mark_dirty(int x0, int y0, int x1, int y1) {
   // second callback guarantees the new source has actually been consumed and
   // the old scanout framebuffer is safe to recycle.
   if (this->pending_framebuffer_index_ != MIPI_RGB_NO_FRAMEBUFFER) {
-    while (static_cast<uint32_t>(this->frame_done_count_ - this->pending_frame_done_count_) < 2u) {
+    // Bounce-buffer mode needs the conservative second boundary because a submit
+    // can race a bounce refill that already captured the previous framebuffer.
+    // Direct EDMA's frame-complete event already means the old framebuffer is
+    // safe to reuse, so waiting for a second event can deadlock the handoff.
+    const uint32_t required_completions = this->bounce_buffer_lines_ == 0 ? 1u : 2u;
+    while (static_cast<uint32_t>(this->frame_done_count_ - this->pending_frame_done_count_) < required_completions) {
       if (xSemaphoreTake(this->frame_done_sem_, pdMS_TO_TICKS(250)) != pdTRUE) {
         ESP_LOGE(TAG, "Timed out waiting for RGB framebuffer handoff");
         this->direct_present_failed_ = true;

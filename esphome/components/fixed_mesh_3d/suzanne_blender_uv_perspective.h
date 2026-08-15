@@ -388,10 +388,17 @@ void benchmark_suzanne_pclk(DisplayT *display, int32_t camera_z = 500) {
     }
   }
 
-  render_suzanne_blender_uv_perspective(display, BENCH_PHASE_X, BENCH_PHASE_Y,
-                                         camera_z, false, false);
+  const PerspectiveStats rendered = render_suzanne_blender_uv_perspective(
+      display, BENCH_PHASE_X, BENCH_PHASE_Y, camera_z, false, false);
   if (bench.finished)
     return;
+
+  // Do not turn a failed begin/present into hundreds of copies of the previous
+  // valid timing sample. This fixed scene always rasterizes many triangles.
+  if (rendered.rasterized_triangles == 0 || rendered.perspective_blocks == 0) {
+    ESP_LOGE(SUZANNE_PERF_TAG, "PCLK_BENCH render did not complete; sample not counted");
+    return;
+  }
 
   const SuzanneFrameTiming frame = get_suzanne_frame_timing();
   if (bench.settle_frames != 0) {
