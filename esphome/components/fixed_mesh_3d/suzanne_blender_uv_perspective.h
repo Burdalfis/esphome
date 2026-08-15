@@ -394,6 +394,9 @@ void benchmark_suzanne_pclk(DisplayT *display, int32_t camera_z = 500) {
     if (!display->set_runtime_pclk_frequency(PCLK_HZ[bench.step])) {
       ESP_LOGE(SUZANNE_PERF_TAG, "PCLK_BENCH unable to set first PCLK");
       bench.finished = true;
+    } else if (display->get_bounce_buffer_lines() == 0 && !display->recover_scanout()) {
+      ESP_LOGE(SUZANNE_PERF_TAG, "PCLK_BENCH unable to recover direct scanout at first PCLK");
+      bench.finished = true;
     } else {
       ESP_LOGI(SUZANNE_PERF_TAG, "PCLK_BENCH settling at %u MHz",
                static_cast<unsigned>(PCLK_HZ[bench.step] / 1000000u));
@@ -456,8 +459,10 @@ void benchmark_suzanne_pclk(DisplayT *display, int32_t camera_z = 500) {
   reset_suzanne_pclk_sample_(bench);
   if (bench.step >= (sizeof(PCLK_HZ) / sizeof(PCLK_HZ[0]))) {
     display->set_runtime_pclk_frequency(bench.original_pclk_hz);
+    if (display->get_bounce_buffer_lines() == 0 && !display->recover_scanout())
+      ESP_LOGE(SUZANNE_PERF_TAG, "PCLK_BENCH failed recovering direct scanout after restore");
     bench.finished = true;
-    ESP_LOGI(SUZANNE_PERF_TAG, "PCLK_BENCH complete | restored %u MHz",
+    ESP_LOGI(SUZANNE_PERF_TAG, "PCLK_BENCH complete | restored %u MHz and recovered scanout",
              static_cast<unsigned>(bench.original_pclk_hz / 1000000u));
     return;
   }
@@ -467,6 +472,16 @@ void benchmark_suzanne_pclk(DisplayT *display, int32_t camera_z = 500) {
     ESP_LOGE(SUZANNE_PERF_TAG, "PCLK_BENCH failed setting %u MHz",
              static_cast<unsigned>(PCLK_HZ[bench.step] / 1000000u));
     display->set_runtime_pclk_frequency(bench.original_pclk_hz);
+    if (display->get_bounce_buffer_lines() == 0)
+      display->recover_scanout();
+    bench.finished = true;
+    return;
+  }
+  if (display->get_bounce_buffer_lines() == 0 && !display->recover_scanout()) {
+    ESP_LOGE(SUZANNE_PERF_TAG, "PCLK_BENCH failed recovering direct scanout at %u MHz",
+             static_cast<unsigned>(PCLK_HZ[bench.step] / 1000000u));
+    display->set_runtime_pclk_frequency(bench.original_pclk_hz);
+    display->recover_scanout();
     bench.finished = true;
     return;
   }

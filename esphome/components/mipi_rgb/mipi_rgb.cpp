@@ -269,6 +269,49 @@ bool MipiRgb::set_runtime_pclk_frequency(uint32_t pclk_frequency) {
   return true;
 }
 
+bool MipiRgb::recover_scanout() {
+#if defined(USE_ESP32_VARIANT_ESP32S3)
+  if (this->handle_ == nullptr || this->frame_done_sem_ == nullptr)
+    return false;
+  if (this->bounce_buffer_lines_ != 0)
+    return true;
+
+  // ESP32-S3's direct-EDMA restart link is built from framebuffer 0. Use that
+  // deliberately as a known synchronization point after a bandwidth-induced
+  // scanout desync. Wait until the restart has crossed VSYNC before resetting
+  // our A/B/C software ownership to match the hardware again.
+  while (xSemaphoreTake(this->frame_done_sem_, 0) == pdTRUE) {
+  }
+  const uint32_t start_vsync = this->vsync_count_;
+  const esp_err_t err = esp_lcd_rgb_panel_restart(this->handle_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to request RGB scanout recovery: %s", esp_err_to_name(err));
+    return false;
+  }
+
+  while (static_cast<uint32_t>(this->vsync_count_ - start_vsync) < 2u) {
+    if (xSemaphoreTake(this->frame_done_sem_, pdMS_TO_TICKS(250)) != pdTRUE) {
+      ESP_LOGE(TAG, "Timed out waiting for RGB scanout recovery");
+      return false;
+    }
+  }
+
+  this->scanout_framebuffer_index_ = 0;
+  this->render_framebuffer_index_ = 1;
+  this->free_framebuffer_index_ = 2;
+  this->pending_framebuffer_index_ = MIPI_RGB_NO_FRAMEBUFFER;
+  this->pending_frame_done_count_ = this->frame_done_count_;
+  this->pending_vsync_count_ = this->vsync_count_;
+  this->direct_present_failed_ = false;
+  while (xSemaphoreTake(this->frame_done_sem_, 0) == pdTRUE) {
+  }
+  ESP_LOGI(TAG, "Direct RGB scanout recovered via FB0 restart");
+  return true;
+#else
+  return false;
+#endif
+}
+
 bool IRAM_ATTR MipiRgb::frame_done_callback_(esp_lcd_panel_handle_t panel,
                                               const esp_lcd_rgb_panel_event_data_t *edata, void *user_ctx) {
   (void) panel;

@@ -47,6 +47,7 @@ class MipiRgb : public display::Display {
   void set_width(uint16_t width) { this->width_ = width; }
   void set_pclk_frequency(uint32_t pclk_frequency) { this->pclk_frequency_ = pclk_frequency; }
   bool set_runtime_pclk_frequency(uint32_t pclk_frequency);
+  bool recover_scanout();
   uint32_t get_pclk_frequency() const { return this->pclk_frequency_; }
   void set_bounce_buffer_lines(size_t lines) { this->bounce_buffer_lines_ = lines; }
   size_t get_bounce_buffer_lines() const { return this->bounce_buffer_lines_; }
