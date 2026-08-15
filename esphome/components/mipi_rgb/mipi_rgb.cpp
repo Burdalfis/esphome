@@ -12,16 +12,18 @@
 namespace esphome::mipi_rgb {
 
 static const uint8_t DELAY_FLAG = 0xFF;
+static constexpr uint8_t MIPI_RGB_NO_FRAMEBUFFER = 0xFF;
 
 // Maximum bytes to log for init commands (truncated if larger)
 static constexpr size_t MIPI_RGB_MAX_CMD_LOG_BYTES = 64;
 
 // ESP32-S3 RGB panels stream their framebuffer from PSRAM through internal-RAM
 // bounce buffers. Give the S3 twenty scanlines of headroom so short cache/PSRAM
-// stalls are less likely to starve the LCD DMA. Keep the existing P4 footprint.
+// stalls are less likely to starve the LCD DMA. Three PSRAM framebuffers let
+// rendering overlap scanout without forcing the producer to wait at every VSYNC.
 #if defined(USE_ESP32_VARIANT_ESP32S3)
 static constexpr size_t MIPI_RGB_BOUNCE_BUFFER_LINES = 20;
-static constexpr size_t MIPI_RGB_FRAMEBUFFER_COUNT = 2;
+static constexpr size_t MIPI_RGB_FRAMEBUFFER_COUNT = 3;
 #else
 static constexpr size_t MIPI_RGB_BOUNCE_BUFFER_LINES = 10;
 static constexpr size_t MIPI_RGB_FRAMEBUFFER_COUNT = 1;
@@ -186,14 +188,21 @@ void MipiRgb::common_setup_() {
 #if defined(USE_ESP32_VARIANT_ESP32S3)
     void *framebuffer0 = nullptr;
     void *framebuffer1 = nullptr;
-    err = esp_lcd_rgb_panel_get_frame_buffer(this->handle_, 2, &framebuffer0, &framebuffer1);
+    void *framebuffer2 = nullptr;
+    err = esp_lcd_rgb_panel_get_frame_buffer(this->handle_, 3, &framebuffer0, &framebuffer1, &framebuffer2);
     if (err == ESP_OK) {
       this->panel_framebuffers_[0] = static_cast<uint16_t *>(framebuffer0);
       this->panel_framebuffers_[1] = static_cast<uint16_t *>(framebuffer1);
-      // The RGB driver starts scanout from framebuffer 0. Render the first
-      // software frame into framebuffer 1 so scanout and rasterization never
-      // touch the same PSRAM image.
+      this->panel_framebuffers_[2] = static_cast<uint16_t *>(framebuffer2);
+      // Framebuffer 0 starts as scanout. Render into 1 while 2 remains spare.
+      // Once 1 is submitted, rendering can immediately continue in 2; the old
+      // scanout buffer becomes the next spare when the frame callback arrives.
+      this->scanout_framebuffer_index_ = 0;
       this->render_framebuffer_index_ = 1;
+      this->free_framebuffer_index_ = 2;
+      this->pending_framebuffer_index_ = MIPI_RGB_NO_FRAMEBUFFER;
+      this->frame_done_count_ = 0;
+      this->pending_frame_done_count_ = 0;
       this->frame_done_sem_ = xSemaphoreCreateBinary();
       if (this->frame_done_sem_ == nullptr) {
         err = ESP_ERR_NO_MEM;
@@ -246,12 +255,13 @@ uint16_t MipiRgb::native_color(const Color &color) {
 }
 
 bool IRAM_ATTR MipiRgb::frame_done_callback_(esp_lcd_panel_handle_t panel,
-                                                   const esp_lcd_rgb_panel_event_data_t *edata, void *user_ctx) {
+                                              const esp_lcd_rgb_panel_event_data_t *edata, void *user_ctx) {
   (void) panel;
   (void) edata;
   auto *self = static_cast<MipiRgb *>(user_ctx);
   if (self == nullptr || self->frame_done_sem_ == nullptr)
     return false;
+  self->frame_done_count_++;
   BaseType_t need_yield = pdFALSE;
   xSemaphoreGiveFromISR(self->frame_done_sem_, &need_yield);
   return need_yield == pdTRUE;
@@ -265,27 +275,53 @@ void MipiRgb::mark_dirty(int x0, int y0, int x1, int y1) {
 #if defined(USE_ESP32_VARIANT_ESP32S3)
   if (this->handle_ == nullptr || this->frame_done_sem_ == nullptr || this->direct_present_failed_)
     return;
-  uint16_t *completed = this->panel_framebuffers_[this->render_framebuffer_index_];
-  if (completed == nullptr)
-    return;
 
-  // Discard an old frame-finish token, present the complete back buffer, then
-  // wait until the RGB driver reports a frame boundary before reusing the old
-  // scanout buffer. Espressif's own LVGL RGB port uses the same handshake.
+  // If a previously submitted framebuffer is still pending, wait here -- after
+  // the CPU has spent an entire frame rendering into the third buffer -- rather
+  // than immediately after submission. With render times longer than one panel
+  // refresh this is normally an immediate semaphore take and removes the old
+  // integer-VSYNC pacing staircase.
+  if (this->pending_framebuffer_index_ != MIPI_RGB_NO_FRAMEBUFFER) {
+    while (this->frame_done_count_ == this->pending_frame_done_count_) {
+      if (xSemaphoreTake(this->frame_done_sem_, pdMS_TO_TICKS(250)) != pdTRUE) {
+        ESP_LOGE(TAG, "Timed out waiting for RGB framebuffer handoff");
+        this->direct_present_failed_ = true;
+        return;
+      }
+    }
+    this->free_framebuffer_index_ = this->scanout_framebuffer_index_;
+    this->scanout_framebuffer_index_ = this->pending_framebuffer_index_;
+    this->pending_framebuffer_index_ = MIPI_RGB_NO_FRAMEBUFFER;
+  }
+
+  // Remove callbacks belonging to subsequent refreshes of the current scanout
+  // image. The generation counter prevents a stale semaphore token from making
+  // us reuse a framebuffer early if a callback races this drain.
   while (xSemaphoreTake(this->frame_done_sem_, 0) == pdTRUE) {
   }
+
+  const uint8_t completed_index = this->render_framebuffer_index_;
+  uint16_t *completed = this->panel_framebuffers_[completed_index];
+  if (completed == nullptr || this->free_framebuffer_index_ == MIPI_RGB_NO_FRAMEBUFFER) {
+    ESP_LOGE(TAG, "No free RGB framebuffer available for triple-buffer present");
+    this->direct_present_failed_ = true;
+    return;
+  }
+
   const esp_err_t err = esp_lcd_panel_draw_bitmap(this->handle_, 0, 0, this->width_, this->height_, completed);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Direct RGB framebuffer present failed: %s", esp_err_to_name(err));
     this->direct_present_failed_ = true;
     return;
   }
-  if (xSemaphoreTake(this->frame_done_sem_, pdMS_TO_TICKS(250)) != pdTRUE) {
-    ESP_LOGE(TAG, "Timed out waiting for RGB frame boundary after framebuffer present");
-    this->direct_present_failed_ = true;
-    return;
-  }
-  this->render_framebuffer_index_ ^= 1u;
+
+  this->pending_framebuffer_index_ = completed_index;
+  // Capture after submission. If a frame callback races this assignment we may
+  // conservatively wait for one additional callback, but we can never reuse the
+  // old scanout buffer too early.
+  this->pending_frame_done_count_ = this->frame_done_count_;
+  this->render_framebuffer_index_ = this->free_framebuffer_index_;
+  this->free_framebuffer_index_ = MIPI_RGB_NO_FRAMEBUFFER;
 #endif
 }
 
@@ -316,7 +352,6 @@ void MipiRgb::update() {
   int h = this->y_high_ - this->y_low_ + 1;
   this->write_to_display_(this->x_low_, this->y_low_, w, h, reinterpret_cast<const uint8_t *>(this->buffer_),
                           this->x_low_, this->y_low_, this->width_ - w - this->x_low_);
-  // invalidate watermarks
   this->x_low_ = this->width_;
   this->y_low_ = this->height_;
   this->x_high_ = 0;
@@ -327,8 +362,6 @@ void MipiRgb::draw_pixels_at(int x_start, int y_start, int w, int h, const uint8
                              display::ColorBitness bitness, bool big_endian, int x_offset, int y_offset, int x_pad) {
   if (w <= 0 || h <= 0 || this->is_failed())
     return;
-  // if color mapping is required, pass the buck.
-  // note that endianness is not considered here - it is assumed to match!
   if (bitness != display::COLOR_BITNESS_565) {
     Display::draw_pixels_at(x_start, y_start, w, h, ptr, order, bitness, big_endian, x_offset, y_offset, x_pad);
     this->write_to_display_(x_start, y_start, w, h, reinterpret_cast<const uint8_t *>(this->buffer_), x_start, y_start,
@@ -342,17 +375,15 @@ void MipiRgb::write_to_display_(int x_start, int y_start, int w, int h, const ui
                                 int x_pad) {
   esp_err_t err = ESP_OK;
   auto stride = (x_offset + w + x_pad) * 2;
-  ptr += y_offset * stride + x_offset * 2;  // skip to the first pixel
-  // x_ and y_offset are offsets into the source buffer, unrelated to our own offsets into the display.
+  ptr += y_offset * stride + x_offset * 2;
   if (x_offset == 0 && x_pad == 0) {
     err = esp_lcd_panel_draw_bitmap(this->handle_, x_start, y_start, x_start + w, y_start + h, ptr);
   } else {
-    // draw line by line
     for (int y = 0; y != h; y++) {
       err = esp_lcd_panel_draw_bitmap(this->handle_, x_start, y + y_start, x_start + w, y + y_start + 1, ptr);
       if (err != ESP_OK)
         break;
-      ptr += stride;  // next line
+      ptr += stride;
     }
   }
   if (err != ESP_OK)
@@ -364,7 +395,6 @@ bool MipiRgb::check_buffer_() {
     return false;
   if (this->buffer_ != nullptr)
     return true;
-  // this is dependent on the enum values.
   RAMAllocator<uint16_t> allocator;
   this->buffer_ = allocator.allocate(this->height_ * this->width_);
   if (this->buffer_ == nullptr) {
@@ -377,7 +407,6 @@ bool MipiRgb::check_buffer_() {
 void MipiRgb::draw_pixel_at(int x, int y, Color color) {
   if (!this->get_clipping().inside(x, y) || this->is_failed())
     return;
-
   switch (this->rotation_) {
     case display::DISPLAY_ROTATION_0_DEGREES:
       break;
@@ -404,7 +433,6 @@ void MipiRgb::draw_pixel_at(int x, int y, Color color) {
   if (this->buffer_[pos] == new_color)
     return;
   this->buffer_[pos] = new_color;
-  // low and high watermark may speed up drawing from buffer
   if (x < this->x_low_)
     this->x_low_ = x;
   if (y < this->y_low_)
@@ -418,7 +446,6 @@ void MipiRgb::fill(Color color) {
   if (!this->check_buffer_())
     return;
 
-  // If clipping is active, fall back to base implementation
   if (this->get_clipping().is_set()) {
     Display::fill(color);
     return;
