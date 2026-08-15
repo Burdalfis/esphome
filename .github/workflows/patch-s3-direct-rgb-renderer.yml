@@ -1,0 +1,36 @@
+name: Patch S3 direct RGB renderer
+
+on:
+  push:
+    branches:
+      - agent/c6-async-mipi-dma
+    paths:
+      - .github/scripts/patch_s3_direct_rgb_renderer.py
+      - .github/workflows/patch-s3-direct-rgb-renderer.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/c6-async-mipi-dma
+      - name: Apply patch
+        run: python .github/scripts/patch_s3_direct_rgb_renderer.py
+      - name: Verify patch
+        run: |
+          grep -q 'esp_lcd_rgb_panel_get_frame_buffer' esphome/components/mipi_rgb/mipi_rgb.cpp
+          grep -q 'Direct RGB framebuffer' esphome/components/mipi_rgb/mipi_rgb.cpp
+          grep -q 'MALLOC_CAP_SPIRAM' esphome/components/mipi_spi/fixed_mesh_renderer.h
+          grep -q 'uint8_t \*z_buffer_' esphome/components/mipi_spi/fixed_mesh_renderer.h
+          ! grep -q 'std::vector<uint8_t> z_buffer_' esphome/components/mipi_spi/fixed_mesh_renderer.h
+      - name: Commit patch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add esphome/components/mipi_rgb/mipi_rgb.h esphome/components/mipi_rgb/mipi_rgb.cpp esphome/components/mipi_spi/fixed_mesh_renderer.h
+          git commit -m 'Add direct RGB framebuffer renderer path [skip ci]'
+          git push origin HEAD:agent/c6-async-mipi-dma
