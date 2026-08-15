@@ -14,6 +14,15 @@ static const uint8_t DELAY_FLAG = 0xFF;
 
 // Maximum bytes to log for init commands (truncated if larger)
 static constexpr size_t MIPI_RGB_MAX_CMD_LOG_BYTES = 64;
+
+// ESP32-S3 RGB panels stream their framebuffer from PSRAM through internal-RAM
+// bounce buffers. Give the S3 twenty scanlines of headroom so short cache/PSRAM
+// stalls are less likely to starve the LCD DMA. Keep the existing P4 footprint.
+#if defined(USE_ESP32_VARIANT_ESP32S3)
+static constexpr size_t MIPI_RGB_BOUNCE_BUFFER_LINES = 20;
+#else
+static constexpr size_t MIPI_RGB_BOUNCE_BUFFER_LINES = 10;
+#endif
 static constexpr uint8_t MADCTL_MY = 0x80;     // Bit 7 Bottom to top
 static constexpr uint8_t MADCTL_MX = 0x40;     // Bit 6 Right to left
 static constexpr uint8_t MADCTL_MV = 0x20;     // Bit 5 Swap axes
@@ -130,7 +139,7 @@ void MipiRgb::setup() {
 void MipiRgb::common_setup_() {
   esp_lcd_rgb_panel_config_t config{};
   config.flags.fb_in_psram = 1;
-  config.bounce_buffer_size_px = this->width_ * 10;
+  config.bounce_buffer_size_px = this->width_ * MIPI_RGB_BOUNCE_BUFFER_LINES;
   config.num_fbs = 1;
   config.timings.h_res = this->width_;
   config.timings.v_res = this->height_;
@@ -175,6 +184,9 @@ void MipiRgb::common_setup_() {
     this->mark_failed(LOG_STR("lcd setup failed"));
   }
   ESP_LOGCONFIG(TAG, "MipiRgb setup complete");
+  ESP_LOGCONFIG(TAG, "RGB bounce buffer: %u lines (%u pixels per buffer)",
+                static_cast<unsigned>(MIPI_RGB_BOUNCE_BUFFER_LINES),
+                static_cast<unsigned>(this->width_ * MIPI_RGB_BOUNCE_BUFFER_LINES));
 }
 
 void MipiRgb::loop() {
