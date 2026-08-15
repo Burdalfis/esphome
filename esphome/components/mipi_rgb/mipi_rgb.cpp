@@ -179,6 +179,12 @@ void MipiRgb::common_setup_() {
     err = esp_lcd_panel_reset(this->handle_);
   if (err == ESP_OK)
     err = esp_lcd_panel_init(this->handle_);
+  if (err == ESP_OK) {
+    void *framebuffer = nullptr;
+    err = esp_lcd_rgb_panel_get_frame_buffer(this->handle_, 1, &framebuffer);
+    if (err == ESP_OK)
+      this->panel_framebuffer_ = static_cast<uint16_t *>(framebuffer);
+  }
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "lcd setup failed: %s", esp_err_to_name(err));
     this->mark_failed(LOG_STR("lcd setup failed"));
@@ -187,6 +193,34 @@ void MipiRgb::common_setup_() {
   ESP_LOGCONFIG(TAG, "RGB bounce buffer: %u lines (%u pixels per buffer)",
                 static_cast<unsigned>(MIPI_RGB_BOUNCE_BUFFER_LINES),
                 static_cast<unsigned>(this->width_ * MIPI_RGB_BOUNCE_BUFFER_LINES));
+  ESP_LOGCONFIG(TAG, "Direct RGB framebuffer: %s (%u bytes in PSRAM)",
+                this->panel_framebuffer_ != nullptr ? "YES" : "NO",
+                static_cast<unsigned>(this->width_ * this->height_ * sizeof(uint16_t)));
+}
+
+uint16_t *MipiRgb::get_framebuffer() {
+  if (this->rotation_ != display::DISPLAY_ROTATION_0_DEGREES)
+    return nullptr;
+  return this->panel_framebuffer_;
+}
+
+size_t MipiRgb::get_framebuffer_stride() {
+  if (this->rotation_ != display::DISPLAY_ROTATION_0_DEGREES)
+    return 0;
+  return this->width_;
+}
+
+uint16_t MipiRgb::native_color(const Color &color) {
+  return convert_big_endian(display::ColorUtil::color_to_565(color));
+}
+
+void MipiRgb::mark_dirty(int x0, int y0, int x1, int y1) {
+  // The renderer writes the continuously scanned ESP-IDF framebuffer directly,
+  // so unlike the SPI display path there is no dirty rectangle to flush.
+  (void) x0;
+  (void) y0;
+  (void) x1;
+  (void) y1;
 }
 
 void MipiRgb::loop() {

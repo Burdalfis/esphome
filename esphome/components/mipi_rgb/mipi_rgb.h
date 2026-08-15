@@ -47,6 +47,14 @@ class MipiRgb : public display::Display {
   void set_model(const char *model) { this->model_ = model; }
   int get_width() override;
   int get_height() override;
+
+  // Direct access to the ESP-IDF RGB scanout framebuffer for performance-sensitive
+  // renderers. The direct path currently requires rotation 0 so logical screen
+  // coordinates and the physical framebuffer stride are identical.
+  uint16_t *get_framebuffer();
+  size_t get_framebuffer_stride();
+  uint16_t native_color(const Color &color);
+  void mark_dirty(int x0, int y0, int x1, int y1);
   void set_hsync_back_porch(uint16_t hsync_back_porch) { this->hsync_back_porch_ = hsync_back_porch; }
   void set_hsync_front_porch(uint16_t hsync_front_porch) { this->hsync_front_porch_ = hsync_front_porch; }
   void set_hsync_pulse_width(uint16_t hsync_pulse_width) { this->hsync_pulse_width_ = hsync_pulse_width; }
@@ -95,6 +103,7 @@ class MipiRgb : public display::Display {
   uint16_t y_high_{0};
 
   esp_lcd_panel_handle_t handle_{};
+  uint16_t *panel_framebuffer_{nullptr};
 };
 
 #ifdef USE_SPI

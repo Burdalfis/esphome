@@ -5,7 +5,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <type_traits>
+
+#if defined(USE_ESP32_VARIANT_ESP32S3)
+#include <esp_heap_caps.h>
+#endif
 #include <utility>
 #include <vector>
 
@@ -178,6 +183,11 @@ template<typename DisplayT, size_t MAX_VERTICES> class FixedMeshRenderer {
   using PixelT = std::remove_pointer_t<decltype(std::declval<DisplayT *>()->get_framebuffer())>;
   static_assert(sizeof(PixelT) == 2, "FixedMeshRenderer requires a 16-bit framebuffer");
 
+  FixedMeshRenderer() = default;
+  ~FixedMeshRenderer() { this->release_z_buffer_(); }
+  FixedMeshRenderer(const FixedMeshRenderer &) = delete;
+  FixedMeshRenderer &operator=(const FixedMeshRenderer &) = delete;
+
   bool begin_frame(DisplayT *display) {
     this->display_ = display;
     this->active_ = false;
@@ -206,9 +216,9 @@ template<typename DisplayT, size_t MAX_VERTICES> class FixedMeshRenderer {
     }
 
     const size_t z_size = static_cast<size_t>(this->screen_w_) * this->screen_h_;
-    if (this->z_buffer_.size() != z_size)
-      this->z_buffer_.resize(z_size);
-    std::memset(this->z_buffer_.data(), 0, z_size);
+    if (!this->ensure_z_buffer_(z_size))
+      return false;
+    std::memset(this->z_buffer_, 0, z_size);
 
     if (!this->palette_order_ready_) {
       const PixelT native_red = display->native_color(Color(248, 0, 0));
@@ -552,7 +562,7 @@ template<typename DisplayT, size_t MAX_VERTICES> class FixedMeshRenderer {
       return;
 
     PixelT *pixel = this->fb_ + static_cast<size_t>(y) * this->stride_ + x0;
-    uint8_t *depth_pixel = this->z_buffer_.data() + static_cast<size_t>(y) * this->screen_w_ + x0;
+    uint8_t *depth_pixel = this->z_buffer_ + static_cast<size_t>(y) * this->screen_w_ + x0;
     const int coord_shift = 16 - material.uv_frac_bits;
     const int32_t coord_scale = int32_t{1} << coord_shift;
 
@@ -698,6 +708,33 @@ template<typename DisplayT, size_t MAX_VERTICES> class FixedMeshRenderer {
     }
   }
 
+  bool ensure_z_buffer_(size_t size) {
+    if (this->z_buffer_ != nullptr && this->z_buffer_size_ == size)
+      return true;
+    this->release_z_buffer_();
+#if defined(USE_ESP32_VARIANT_ESP32S3)
+    this->z_buffer_ = static_cast<uint8_t *>(heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+#else
+    this->z_buffer_ = static_cast<uint8_t *>(std::malloc(size));
+#endif
+    if (this->z_buffer_ == nullptr)
+      return false;
+    this->z_buffer_size_ = size;
+    return true;
+  }
+
+  void release_z_buffer_() {
+    if (this->z_buffer_ == nullptr)
+      return;
+#if defined(USE_ESP32_VARIANT_ESP32S3)
+    heap_caps_free(this->z_buffer_);
+#else
+    std::free(this->z_buffer_);
+#endif
+    this->z_buffer_ = nullptr;
+    this->z_buffer_size_ = 0;
+  }
+
   DisplayT *display_{nullptr};
   PixelT *fb_{nullptr};
   PixelT black_{};
@@ -720,7 +757,8 @@ template<typename DisplayT, size_t MAX_VERTICES> class FixedMeshRenderer {
   int32_t new_y1_{0};
   uint32_t dma_high_water_bytes_{0};
   FixedMeshStats stats_{};
-  std::vector<uint8_t> z_buffer_{};
+  uint8_t *z_buffer_{nullptr};
+  size_t z_buffer_size_{0};
   std::array<FixedMeshProjectedVertex, MAX_VERTICES> projected_{};
 };
 
