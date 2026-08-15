@@ -81,6 +81,8 @@ class MipiRgb : public display::Display {
   void common_setup_();
   static bool IRAM_ATTR frame_done_callback_(esp_lcd_panel_handle_t panel,
                                               const esp_lcd_rgb_panel_event_data_t *edata, void *user_ctx);
+  static bool IRAM_ATTR vsync_callback_(esp_lcd_panel_handle_t panel,
+                                        const esp_lcd_rgb_panel_event_data_t *edata, void *user_ctx);
   InternalGPIOPin *de_pin_{nullptr};
   InternalGPIOPin *pclk_pin_{nullptr};
   InternalGPIOPin *hsync_pin_{nullptr};
@@ -119,7 +121,9 @@ class MipiRgb : public display::Display {
   uint8_t free_framebuffer_index_{2};
   uint8_t pending_framebuffer_index_{0xFF};
   volatile uint32_t frame_done_count_{0};
+  volatile uint32_t vsync_count_{0};
   uint32_t pending_frame_done_count_{0};
+  uint32_t pending_vsync_count_{0};
   SemaphoreHandle_t frame_done_sem_{nullptr};
   bool direct_present_failed_{false};
 };

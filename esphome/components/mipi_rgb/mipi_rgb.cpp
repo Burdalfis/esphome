@@ -199,12 +199,15 @@ void MipiRgb::common_setup_() {
       this->free_framebuffer_index_ = 2;
       this->pending_framebuffer_index_ = MIPI_RGB_NO_FRAMEBUFFER;
       this->frame_done_count_ = 0;
+      this->vsync_count_ = 0;
       this->pending_frame_done_count_ = 0;
+      this->pending_vsync_count_ = 0;
       this->frame_done_sem_ = xSemaphoreCreateBinary();
       if (this->frame_done_sem_ == nullptr) {
         err = ESP_ERR_NO_MEM;
       } else {
         esp_lcd_rgb_panel_event_callbacks_t callbacks{};
+        callbacks.on_vsync = &MipiRgb::vsync_callback_;
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
         callbacks.on_frame_buf_complete = &MipiRgb::frame_done_callback_;
 #elif ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 2)
@@ -279,6 +282,19 @@ bool IRAM_ATTR MipiRgb::frame_done_callback_(esp_lcd_panel_handle_t panel,
   return need_yield == pdTRUE;
 }
 
+bool IRAM_ATTR MipiRgb::vsync_callback_(esp_lcd_panel_handle_t panel,
+                                        const esp_lcd_rgb_panel_event_data_t *edata, void *user_ctx) {
+  (void) panel;
+  (void) edata;
+  auto *self = static_cast<MipiRgb *>(user_ctx);
+  if (self == nullptr || self->frame_done_sem_ == nullptr)
+    return false;
+  self->vsync_count_++;
+  BaseType_t need_yield = pdFALSE;
+  xSemaphoreGiveFromISR(self->frame_done_sem_, &need_yield);
+  return need_yield == pdTRUE;
+}
+
 void MipiRgb::mark_dirty(int x0, int y0, int x1, int y1) {
   (void) x0;
   (void) y0;
@@ -296,12 +312,23 @@ void MipiRgb::mark_dirty(int x0, int y0, int x1, int y1) {
   // second callback guarantees the new source has actually been consumed and
   // the old scanout framebuffer is safe to recycle.
   if (this->pending_framebuffer_index_ != MIPI_RGB_NO_FRAMEBUFFER) {
-    // Bounce-buffer mode needs the conservative second boundary because a submit
-    // can race a bounce refill that already captured the previous framebuffer.
-    // Direct EDMA's frame-complete event already means the old framebuffer is
-    // safe to reuse, so waiting for a second event can deadlock the handoff.
-    const uint32_t required_completions = this->bounce_buffer_lines_ == 0 ? 1u : 2u;
-    while (static_cast<uint32_t>(this->frame_done_count_ - this->pending_frame_done_count_) < required_completions) {
+    // Bounce-buffer mode uses the frame-complete event and keeps the conservative
+    // two-boundary guard against an ISR that already captured the old source.
+    //
+    // On ESP32-S3 direct EDMA, IDF notes that frame-complete can be unreliable
+    // after GDMA prefetch. Accept it immediately when it does arrive (the API
+    // defines that event as safe reuse), otherwise fall back to two VSYNCs. A
+    // prefetched old link can therefore be displayed once more without letting
+    // the renderer overwrite it while GDMA may still be reading it.
+    while (true) {
+      const uint32_t frame_done_delta =
+          static_cast<uint32_t>(this->frame_done_count_ - this->pending_frame_done_count_);
+      const uint32_t vsync_delta = static_cast<uint32_t>(this->vsync_count_ - this->pending_vsync_count_);
+      const bool handoff_complete = this->bounce_buffer_lines_ == 0
+                                        ? (frame_done_delta >= 1u || vsync_delta >= 2u)
+                                        : (frame_done_delta >= 2u);
+      if (handoff_complete)
+        break;
       if (xSemaphoreTake(this->frame_done_sem_, pdMS_TO_TICKS(250)) != pdTRUE) {
         ESP_LOGE(TAG, "Timed out waiting for RGB framebuffer handoff");
         this->direct_present_failed_ = true;
@@ -336,13 +363,19 @@ void MipiRgb::mark_dirty(int x0, int y0, int x1, int y1) {
 
   this->pending_framebuffer_index_ = completed_index;
   this->pending_frame_done_count_ = this->frame_done_count_;
+  this->pending_vsync_count_ = this->vsync_count_;
   this->render_framebuffer_index_ = this->free_framebuffer_index_;
   this->free_framebuffer_index_ = MIPI_RGB_NO_FRAMEBUFFER;
 #endif
 }
 
 void MipiRgb::loop() {
-  if (this->handle_ != nullptr)
+  // The restart workaround is useful for bounce-buffer recovery, but on ESP32-S3
+  // the direct-EDMA restart link is built from framebuffer 0. Restarting every
+  // VSYNC therefore fights multi-framebuffer scanout and can pin the DMA back to
+  // FB0. Leave direct EDMA running continuously and let IDF switch framebuffer
+  // links normally.
+  if (this->handle_ != nullptr && this->bounce_buffer_lines_ != 0)
     esp_lcd_rgb_panel_restart(this->handle_);
 }
 
