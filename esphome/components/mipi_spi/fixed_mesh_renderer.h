@@ -210,10 +210,11 @@ template<typename DisplayT, size_t MAX_VERTICES> class FixedMeshRenderer {
       this->screen_w_ = new_w;
       this->screen_h_ = new_h;
       this->stride_ = new_stride;
-      this->frame_initialized_ = false;
-      this->have_old_box_ = false;
+      this->reset_buffer_states_();
       this->palette_order_ready_ = false;
     }
+    if (!this->select_buffer_state_(this->fb_))
+      return false;
 
     const size_t z_size = static_cast<size_t>(this->screen_w_) * this->screen_h_;
     if (!this->ensure_z_buffer_(z_size))
@@ -465,6 +466,7 @@ template<typename DisplayT, size_t MAX_VERTICES> class FixedMeshRenderer {
     }
     this->have_old_box_ = this->have_new_box_;
     this->frame_initialized_ = true;
+    this->save_buffer_state_();
     this->active_ = false;
     return this->stats_;
   }
@@ -708,6 +710,60 @@ template<typename DisplayT, size_t MAX_VERTICES> class FixedMeshRenderer {
     }
   }
 
+  struct BufferState {
+    PixelT *framebuffer{nullptr};
+    bool frame_initialized{false};
+    bool have_old_box{false};
+    int32_t old_x0{0};
+    int32_t old_y0{0};
+    int32_t old_x1{0};
+    int32_t old_y1{0};
+  };
+
+  void reset_buffer_states_() {
+    for (auto &state : this->buffer_states_)
+      state = {};
+    this->buffer_state_ = nullptr;
+    this->frame_initialized_ = false;
+    this->have_old_box_ = false;
+  }
+
+  bool select_buffer_state_(PixelT *framebuffer) {
+    BufferState *empty = nullptr;
+    for (auto &state : this->buffer_states_) {
+      if (state.framebuffer == framebuffer) {
+        this->buffer_state_ = &state;
+        break;
+      }
+      if (state.framebuffer == nullptr && empty == nullptr)
+        empty = &state;
+    }
+    if (this->buffer_state_ == nullptr) {
+      if (empty == nullptr)
+        return false;
+      empty->framebuffer = framebuffer;
+      this->buffer_state_ = empty;
+    }
+    this->frame_initialized_ = this->buffer_state_->frame_initialized;
+    this->have_old_box_ = this->buffer_state_->have_old_box;
+    this->old_x0_ = this->buffer_state_->old_x0;
+    this->old_y0_ = this->buffer_state_->old_y0;
+    this->old_x1_ = this->buffer_state_->old_x1;
+    this->old_y1_ = this->buffer_state_->old_y1;
+    return true;
+  }
+
+  void save_buffer_state_() {
+    if (this->buffer_state_ == nullptr)
+      return;
+    this->buffer_state_->frame_initialized = this->frame_initialized_;
+    this->buffer_state_->have_old_box = this->have_old_box_;
+    this->buffer_state_->old_x0 = this->old_x0_;
+    this->buffer_state_->old_y0 = this->old_y0_;
+    this->buffer_state_->old_x1 = this->old_x1_;
+    this->buffer_state_->old_y1 = this->old_y1_;
+  }
+
   bool ensure_z_buffer_(size_t size) {
     if (this->z_buffer_ != nullptr && this->z_buffer_size_ == size)
       return true;
@@ -759,6 +815,8 @@ template<typename DisplayT, size_t MAX_VERTICES> class FixedMeshRenderer {
   FixedMeshStats stats_{};
   uint8_t *z_buffer_{nullptr};
   size_t z_buffer_size_{0};
+  std::array<BufferState, 3> buffer_states_{};
+  BufferState *buffer_state_{nullptr};
   std::array<FixedMeshProjectedVertex, MAX_VERTICES> projected_{};
 };
 

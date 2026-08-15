@@ -6,6 +6,7 @@
 #include "esphome/core/log.h"
 #include <driver/gpio.h>
 #include <esp_lcd_panel_rgb.h>
+#include <esp_idf_version.h>
 #include <span>
 
 namespace esphome::mipi_rgb {
@@ -20,8 +21,10 @@ static constexpr size_t MIPI_RGB_MAX_CMD_LOG_BYTES = 64;
 // stalls are less likely to starve the LCD DMA. Keep the existing P4 footprint.
 #if defined(USE_ESP32_VARIANT_ESP32S3)
 static constexpr size_t MIPI_RGB_BOUNCE_BUFFER_LINES = 20;
+static constexpr size_t MIPI_RGB_FRAMEBUFFER_COUNT = 2;
 #else
 static constexpr size_t MIPI_RGB_BOUNCE_BUFFER_LINES = 10;
+static constexpr size_t MIPI_RGB_FRAMEBUFFER_COUNT = 1;
 #endif
 static constexpr uint8_t MADCTL_MY = 0x80;     // Bit 7 Bottom to top
 static constexpr uint8_t MADCTL_MX = 0x40;     // Bit 6 Right to left
@@ -140,7 +143,7 @@ void MipiRgb::common_setup_() {
   esp_lcd_rgb_panel_config_t config{};
   config.flags.fb_in_psram = 1;
   config.bounce_buffer_size_px = this->width_ * MIPI_RGB_BOUNCE_BUFFER_LINES;
-  config.num_fbs = 1;
+  config.num_fbs = MIPI_RGB_FRAMEBUFFER_COUNT;
   config.timings.h_res = this->width_;
   config.timings.v_res = this->height_;
   config.timings.hsync_pulse_width = this->hsync_pulse_width_;
@@ -180,10 +183,38 @@ void MipiRgb::common_setup_() {
   if (err == ESP_OK)
     err = esp_lcd_panel_init(this->handle_);
   if (err == ESP_OK) {
-    void *framebuffer = nullptr;
-    err = esp_lcd_rgb_panel_get_frame_buffer(this->handle_, 1, &framebuffer);
+#if defined(USE_ESP32_VARIANT_ESP32S3)
+    void *framebuffer0 = nullptr;
+    void *framebuffer1 = nullptr;
+    err = esp_lcd_rgb_panel_get_frame_buffer(this->handle_, 2, &framebuffer0, &framebuffer1);
+    if (err == ESP_OK) {
+      this->panel_framebuffers_[0] = static_cast<uint16_t *>(framebuffer0);
+      this->panel_framebuffers_[1] = static_cast<uint16_t *>(framebuffer1);
+      // The RGB driver starts scanout from framebuffer 0. Render the first
+      // software frame into framebuffer 1 so scanout and rasterization never
+      // touch the same PSRAM image.
+      this->render_framebuffer_index_ = 1;
+      this->frame_done_sem_ = xSemaphoreCreateBinary();
+      if (this->frame_done_sem_ == nullptr) {
+        err = ESP_ERR_NO_MEM;
+      } else {
+        esp_lcd_rgb_panel_event_callbacks_t callbacks{};
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
+        callbacks.on_frame_buf_complete = &MipiRgb::frame_done_callback_;
+#elif ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 2)
+        callbacks.on_bounce_frame_finish = &MipiRgb::frame_done_callback_;
+#else
+        callbacks.on_vsync = &MipiRgb::frame_done_callback_;
+#endif
+        err = esp_lcd_rgb_panel_register_event_callbacks(this->handle_, &callbacks, this);
+      }
+    }
+#else
+    void *framebuffer0 = nullptr;
+    err = esp_lcd_rgb_panel_get_frame_buffer(this->handle_, 1, &framebuffer0);
     if (err == ESP_OK)
-      this->panel_framebuffer_ = static_cast<uint16_t *>(framebuffer);
+      this->panel_framebuffers_[0] = static_cast<uint16_t *>(framebuffer0);
+#endif
   }
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "lcd setup failed: %s", esp_err_to_name(err));
@@ -193,15 +224,15 @@ void MipiRgb::common_setup_() {
   ESP_LOGCONFIG(TAG, "RGB bounce buffer: %u lines (%u pixels per buffer)",
                 static_cast<unsigned>(MIPI_RGB_BOUNCE_BUFFER_LINES),
                 static_cast<unsigned>(this->width_ * MIPI_RGB_BOUNCE_BUFFER_LINES));
-  ESP_LOGCONFIG(TAG, "Direct RGB framebuffer: %s (%u bytes in PSRAM)",
-                this->panel_framebuffer_ != nullptr ? "YES" : "NO",
+  ESP_LOGCONFIG(TAG, "Direct RGB framebuffers: %u (%u bytes each in PSRAM)",
+                static_cast<unsigned>(MIPI_RGB_FRAMEBUFFER_COUNT),
                 static_cast<unsigned>(this->width_ * this->height_ * sizeof(uint16_t)));
 }
 
 uint16_t *MipiRgb::get_framebuffer() {
-  if (this->rotation_ != display::DISPLAY_ROTATION_0_DEGREES)
+  if (this->rotation_ != display::DISPLAY_ROTATION_0_DEGREES || this->direct_present_failed_)
     return nullptr;
-  return this->panel_framebuffer_;
+  return this->panel_framebuffers_[this->render_framebuffer_index_];
 }
 
 size_t MipiRgb::get_framebuffer_stride() {
@@ -214,13 +245,48 @@ uint16_t MipiRgb::native_color(const Color &color) {
   return convert_big_endian(display::ColorUtil::color_to_565(color));
 }
 
+bool IRAM_ATTR MipiRgb::frame_done_callback_(esp_lcd_panel_handle_t panel,
+                                                   const esp_lcd_rgb_panel_event_data_t *edata, void *user_ctx) {
+  (void) panel;
+  (void) edata;
+  auto *self = static_cast<MipiRgb *>(user_ctx);
+  if (self == nullptr || self->frame_done_sem_ == nullptr)
+    return false;
+  BaseType_t need_yield = pdFALSE;
+  xSemaphoreGiveFromISR(self->frame_done_sem_, &need_yield);
+  return need_yield == pdTRUE;
+}
+
 void MipiRgb::mark_dirty(int x0, int y0, int x1, int y1) {
-  // The renderer writes the continuously scanned ESP-IDF framebuffer directly,
-  // so unlike the SPI display path there is no dirty rectangle to flush.
   (void) x0;
   (void) y0;
   (void) x1;
   (void) y1;
+#if defined(USE_ESP32_VARIANT_ESP32S3)
+  if (this->handle_ == nullptr || this->frame_done_sem_ == nullptr || this->direct_present_failed_)
+    return;
+  uint16_t *completed = this->panel_framebuffers_[this->render_framebuffer_index_];
+  if (completed == nullptr)
+    return;
+
+  // Discard an old frame-finish token, present the complete back buffer, then
+  // wait until the RGB driver reports a frame boundary before reusing the old
+  // scanout buffer. Espressif's own LVGL RGB port uses the same handshake.
+  while (xSemaphoreTake(this->frame_done_sem_, 0) == pdTRUE) {
+  }
+  const esp_err_t err = esp_lcd_panel_draw_bitmap(this->handle_, 0, 0, this->width_, this->height_, completed);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Direct RGB framebuffer present failed: %s", esp_err_to_name(err));
+    this->direct_present_failed_ = true;
+    return;
+  }
+  if (xSemaphoreTake(this->frame_done_sem_, pdMS_TO_TICKS(250)) != pdTRUE) {
+    ESP_LOGE(TAG, "Timed out waiting for RGB frame boundary after framebuffer present");
+    this->direct_present_failed_ = true;
+    return;
+  }
+  this->render_framebuffer_index_ ^= 1u;
+#endif
 }
 
 void MipiRgb::loop() {

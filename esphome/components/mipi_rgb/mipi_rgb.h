@@ -4,6 +4,9 @@
 #include "esphome/core/gpio.h"
 #include "esphome/components/display/display.h"
 #include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_rgb.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #ifdef USE_SPI
 #include "esphome/components/spi/spi.h"
 #endif
@@ -76,6 +79,8 @@ class MipiRgb : public display::Display {
   void dump_pins_(uint8_t start, uint8_t end, const char *name, uint8_t offset);
   void setup_enables_();
   void common_setup_();
+  static bool IRAM_ATTR frame_done_callback_(esp_lcd_panel_handle_t panel,
+                                              const esp_lcd_rgb_panel_event_data_t *edata, void *user_ctx);
   InternalGPIOPin *de_pin_{nullptr};
   InternalGPIOPin *pclk_pin_{nullptr};
   InternalGPIOPin *hsync_pin_{nullptr};
@@ -103,7 +108,10 @@ class MipiRgb : public display::Display {
   uint16_t y_high_{0};
 
   esp_lcd_panel_handle_t handle_{};
-  uint16_t *panel_framebuffer_{nullptr};
+  uint16_t *panel_framebuffers_[2]{nullptr, nullptr};
+  uint8_t render_framebuffer_index_{1};
+  SemaphoreHandle_t frame_done_sem_{nullptr};
+  bool direct_present_failed_{false};
 };
 
 #ifdef USE_SPI
